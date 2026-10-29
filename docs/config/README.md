@@ -2592,8 +2592,10 @@ boundary. The nearest build file takes precedence; Gradle plugin defaults can co
 from root build/settings files. Maven supports local parents at `../pom.xml`.
 A root containing only `plugins { base }` can use the declarations of one literal
 `include("module")` (or Groovy `include 'module'`) from its settings file. Colon-separated
-nested paths are supported. Multiple/dynamic modules, project directory/build-file
-remapping, and child paths outside the root remain unresolved; no directory tree is scanned.
+nested paths are supported. Settings must contain only that standalone include, a literal
+root name, and optional plugin/repository-management blocks. Conditional/qualified includes,
+module-directory aliases, descriptor remapping, and declaration files outside the root or
+across nested build/repository boundaries remain unresolved; no directory tree is scanned.
 Remote parents, active-profile evaluation, arbitrary Gradle expressions, convention
 plugins, and task-specific compiler overrides are not evaluated. Conflicting or
 unsupported version declarations are omitted rather than guessed.
@@ -3015,8 +3017,10 @@ boundary. The nearest build file takes precedence; Gradle plugin defaults can co
 from root build/settings files. Maven supports local parents at `../pom.xml`.
 A root containing only `plugins { base }` can use the declarations of one literal
 `include("module")` (or Groovy `include 'module'`) from its settings file. Colon-separated
-nested paths are supported. Multiple/dynamic modules, project directory/build-file
-remapping, and child paths outside the root remain unresolved; no directory tree is scanned.
+nested paths are supported. Settings must contain only that standalone include, a literal
+root name, and optional plugin/repository-management blocks. Conditional/qualified includes,
+module-directory aliases, descriptor remapping, and declaration files outside the root or
+across nested build/repository boundaries remain unresolved; no directory tree is scanned.
 Remote parents, active-profile evaluation, arbitrary Gradle expressions, convention
 plugins, and task-specific compiler overrides are not evaluated. Conflicting or
 unsupported version declarations are omitted rather than guessed.

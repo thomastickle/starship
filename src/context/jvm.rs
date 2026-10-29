@@ -23,6 +23,7 @@ struct Inputs {
     remaining: u64,
     files: BTreeMap<PathBuf, Option<String>>,
     failed: bool,
+    declaration_root: Option<PathBuf>,
 }
 
 impl Inputs {
@@ -33,6 +34,7 @@ impl Inputs {
             remaining: TOTAL_LIMIT,
             files: BTreeMap::new(),
             failed: false,
+            declaration_root: None,
         }
     }
 
@@ -40,10 +42,32 @@ impl Inputs {
         self.start.elapsed() >= self.budget
     }
 
+    fn restrict_declarations_to(&mut self, root: &Path) -> Option<()> {
+        // Cached inputs must satisfy the same boundary checks as subsequent reads.
+        if self
+            .files
+            .keys()
+            .any(|path| self.expired() || !declaration_in_root(root, path))
+        {
+            self.failed = true;
+            return None;
+        }
+        self.declaration_root = Some(root.to_path_buf());
+        Some(())
+    }
+
     fn read(&mut self, path: PathBuf) -> Option<String> {
         // A failed decode may already have consumed the remaining byte allowance.
         // Stop before another read rather than accounting only for decoded strings.
         if self.failed || self.expired() {
+            return None;
+        }
+        if self
+            .declaration_root
+            .as_ref()
+            .is_some_and(|root| !declaration_in_root(root, &path))
+        {
+            self.failed = true;
             return None;
         }
         if let Some(contents) = self.files.get(&path) {
@@ -62,6 +86,31 @@ impl Inputs {
         self.files.insert(path, contents.clone());
         contents
     }
+}
+
+fn declaration_in_root(root: &Path, path: &Path) -> bool {
+    let actual = match dunce::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+    };
+    if !actual.starts_with(root) {
+        return false;
+    }
+    let Some(parent) = actual.parent() else {
+        return false;
+    };
+    for directory in parent.ancestors().take(MAX_DEPTH) {
+        if directory == root {
+            return true;
+        }
+        if [".git", "settings.gradle", "settings.gradle.kts"]
+            .iter()
+            .any(|name| directory.join(name).exists())
+        {
+            return false;
+        }
+    }
+    false
 }
 
 pub(super) fn resolve(directory: &Path, budget: Duration) -> Versions {
@@ -399,70 +448,124 @@ fn is_base_aggregator(build: &str) -> bool {
     })
 }
 
-fn single_gradle_module(settings: &str) -> Option<PathBuf> {
-    let tokens = tokens(settings)?;
-    let mut depth = 0_usize;
-    let mut module = None;
-    for (index, token) in tokens.iter().enumerate() {
-        // Descriptor changes and composite/dynamic inclusion invalidate the default
-        // directory mapping. Never fall back to searching directories on disk.
-        if matches!(
-            token.as_str(),
-            "project" | "includeFlat" | "includeBuild" | "apply"
-        ) || token.ends_with(".projectDir")
-            || token.ends_with(".buildFileName")
+fn included_module_path(name: &str) -> Option<PathBuf> {
+    let mut path = PathBuf::new();
+    let parts: Vec<_> = name.strip_prefix(':').unwrap_or(name).split(':').collect();
+    if parts.len() >= MAX_DEPTH {
+        return None;
+    }
+    for part in parts {
+        if part.is_empty()
+            || matches!(part, "." | "..")
+            || !part
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
         {
             return None;
         }
-        match token.as_str() {
-            "{" => {
-                depth += 1;
-                if depth > 64 {
-                    return None;
-                }
-            }
-            "}" => depth = depth.checked_sub(1)?,
-            "include" => {
-                if depth != 0 || module.is_some() {
-                    return None;
-                }
-                let rest: Vec<&str> = tokens[index + 1..].iter().map(String::as_str).collect();
-                let (name, tail) = match rest.as_slice() {
-                    ["(", name, ")", tail @ ..] => (unquote(name)?, tail),
-                    [name, tail @ ..] => (unquote(name)?, tail),
-                    _ => return None,
-                };
-                if !tail.is_empty() && tail[0] != ";" {
-                    return None;
-                }
-                let mut path = PathBuf::new();
-                let parts: Vec<_> = name.strip_prefix(':').unwrap_or(name).split(':').collect();
-                if parts.len() >= MAX_DEPTH {
-                    return None;
-                }
-                for part in parts {
-                    if part.is_empty()
-                        || matches!(part, "." | "..")
-                        || !part
-                            .bytes()
-                            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
-                    {
-                        return None;
-                    }
-                    path.push(part);
-                }
-                module = Some(path);
-            }
-            _ => (),
-        }
+        path.push(part);
     }
-    if depth != 0 {
+    Some(path)
+}
+
+fn settings_statement(statement: &[&str], module: &mut Option<PathBuf>) -> Option<()> {
+    match statement {
+        [] => (),
+        ["include", "(", name, ")"] | ["include", name] => {
+            if module.is_some() {
+                return None;
+            }
+            *module = Some(included_module_path(unquote(name)?)?);
+        }
+        ["rootProject.name", "=", name] if unquote(name).is_some() => (),
+        [
+            "pluginManagement" | "dependencyResolutionManagement",
+            "{",
+            rest @ ..,
+        ] if rest.last() == Some(&"}") => {
+            let mut depth = 1_usize;
+            for (index, token) in rest.iter().enumerate() {
+                match *token {
+                    "{" => depth += 1,
+                    "}" => depth = depth.checked_sub(1)?,
+                    _ => (),
+                }
+                if depth == 0 && index + 1 != rest.len() {
+                    return None;
+                }
+            }
+            if depth != 0 {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn single_gradle_module(settings: &str) -> Option<PathBuf> {
+    let tokens = tokens(settings)?;
+    let mut nesting = [0_usize; 3];
+    let mut statement = Vec::new();
+    let mut module = None;
+    for token in &tokens {
+        let word = token.as_str();
+        let method = word.rsplit('.').next()?;
+        // No conditional/qualified calls, composite builds, descriptor changes,
+        // or externally applied settings scripts can silently add/remap modules.
+        if matches!(
+            method,
+            "project" | "includeFlat" | "includeBuild" | "apply" | "projectDir" | "buildFileName"
+        ) || (method == "include" && word != "include")
+        {
+            return None;
+        }
+        if word == ";" {
+            if nesting == [0; 3] {
+                settings_statement(&statement, &mut module)?;
+                statement.clear();
+            }
+            continue;
+        }
+        let delimiter = match word {
+            "{" => Some((0, true)),
+            "}" => Some((0, false)),
+            "(" => Some((1, true)),
+            ")" => Some((1, false)),
+            "[" => Some((2, true)),
+            "]" => Some((2, false)),
+            _ => None,
+        };
+        if let Some((kind, opening)) = delimiter {
+            nesting[kind] = if opening {
+                nesting[kind].checked_add(1)?
+            } else {
+                nesting[kind].checked_sub(1)?
+            };
+            if nesting[kind] > 64 {
+                return None;
+            }
+        }
+        // Includes are accepted only as complete top-level statements, not from
+        // a known settings block's body or inside another call's arguments.
+        if word == "include" && nesting != [0; 3] {
+            return None;
+        }
+        statement.push(word);
+    }
+    if nesting != [0; 3] {
         return None;
     }
+    settings_statement(&statement, &mut module)?;
     module
 }
 
 fn gradle_sole_module(root: &Path, inputs: &mut Inputs) -> Option<Versions> {
+    if inputs.failed || inputs.expired() {
+        return None;
+    }
+    let physical_root = dunce::canonicalize(root).ok()?;
+    inputs.restrict_declarations_to(&physical_root)?;
     let settings = match (
         inputs.read(root.join("settings.gradle.kts")),
         inputs.read(root.join("settings.gradle")),
@@ -470,21 +573,20 @@ fn gradle_sole_module(root: &Path, inputs: &mut Inputs) -> Option<Versions> {
         (Some(settings), None) | (None, Some(settings)) => settings,
         _ => return None,
     };
-    let module = root.join(single_gradle_module(&settings)?);
+    let relative = single_gradle_module(&settings)?;
     if inputs.failed || inputs.expired() {
         return None;
     }
-    // A declared child must stay inside the root even when directories are symlinked.
-    if !dunce::canonicalize(&module)
-        .ok()?
-        .starts_with(dunce::canonicalize(root).ok()?)
-    {
+    let module = dunce::canonicalize(root.join(&relative)).ok()?;
+    // Module directory aliases can change both ancestry and property inheritance.
+    // Stay with the default physical mapping instead of guessing their semantics.
+    if module != physical_root.join(relative) {
         return None;
     }
     let mut directories: Vec<_> = module.ancestors().take(MAX_DEPTH).collect();
     let root_index = directories
         .iter()
-        .position(|directory| *directory == root)?;
+        .position(|directory| *directory == physical_root)?;
     if directories[..root_index].iter().any(|directory| {
         [".git", "settings.gradle", "settings.gradle.kts"]
             .iter()
@@ -763,7 +865,7 @@ mod tests {
             &[
                 (
                     "settings.gradle.kts",
-                    "rootProject.name = \"example\"\ninclude(\"backend\")",
+                    "pluginManagement { repositories { gradlePluginPortal(); mavenCentral() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { mavenCentral() } }\nrootProject.name = \"example\"\ninclude(\"backend\")",
                 ),
                 ("build.gradle.kts", "plugins { base }"),
                 (
@@ -824,6 +926,149 @@ mod tests {
             )?;
             assert!(versions.kotlin.is_none(), "{settings}");
             assert!(versions.java.is_none(), "{settings}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_root_requires_a_standalone_unconditional_include() -> io::Result<()> {
+        for settings in [
+            "if (false) include(\"backend\")",
+            "if (false)\ninclude(\"backend\")",
+            "enabled && include(\"backend\")",
+            "enabled &&\ninclude(\"backend\")",
+            "val result = include(\"backend\")",
+            "someCall(\ninclude(\"backend\")\n)",
+            "include(\"backend\")\nsettings.include(\"other\")",
+            "include(\"backend\")\nsettings.includeFlat(\"other\")",
+            "include(\"backend\")\nsettings.includeBuild(\"other\")",
+        ] {
+            let versions = fixture(
+                &[
+                    ("settings.gradle.kts", settings),
+                    ("build.gradle.kts", "plugins { base }"),
+                    (
+                        "backend/build.gradle.kts",
+                        "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                    ),
+                ],
+                "",
+            )?;
+            assert!(versions.kotlin.is_none(), "{settings}");
+            assert!(versions.java.is_none(), "{settings}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gradle_root_cannot_follow_an_alias_under_a_nested_repository() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("other/child"))?;
+        for (name, text) in [
+            ("settings.gradle.kts", "include(\"backend\")"),
+            ("build.gradle.kts", "plugins { base }"),
+            ("other/.git", ""),
+            (
+                "other/child/build.gradle.kts",
+                "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+            ),
+        ] {
+            let mut file = std::fs::File::create(root.path().join(name))?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::os::unix::fs::symlink(root.path().join("other/child"), root.path().join("backend"))?;
+        let versions = resolve(root.path(), Duration::from_millis(30));
+        assert!(versions.kotlin.is_none());
+        assert!(versions.java.is_none());
+        root.close()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gradle_root_cannot_read_a_declaration_file_link_outside_the_build() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("backend"))?;
+        for (path, text) in [
+            (
+                root.path().join("settings.gradle.kts"),
+                "include(\"backend\")",
+            ),
+            (root.path().join("build.gradle.kts"), "plugins { base }"),
+            (
+                outside.path().join("build.gradle.kts"),
+                "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+            ),
+        ] {
+            let mut file = std::fs::File::create(path)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::os::unix::fs::symlink(
+            outside.path().join("build.gradle.kts"),
+            root.path().join("backend/build.gradle.kts"),
+        )?;
+        let versions = resolve(root.path(), Duration::from_millis(30));
+        assert!(versions.kotlin.is_none());
+        assert!(versions.java.is_none());
+        root.close()?;
+        outside.close()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gradle_aggregation_checks_all_declaration_files_and_cached_inputs() -> io::Result<()> {
+        for (redirected, boundary) in [
+            ("settings.gradle.kts", None),
+            ("build.gradle.kts", None),
+            ("backend/build.gradle.kts", None),
+            ("gradle.properties", None),
+            ("gradle/libs.versions.toml", None),
+            ("backend/build.gradle.kts", Some(".git")),
+            ("backend/build.gradle.kts", Some("settings.gradle.kts")),
+        ] {
+            let root = tempfile::tempdir()?;
+            let outside = tempfile::tempdir()?;
+            let target_directory = if boundary.is_some() {
+                root.path().join("nested")
+            } else {
+                outside.path().to_path_buf()
+            };
+            std::fs::create_dir_all(&target_directory)?;
+            if let Some(marker) = boundary {
+                std::fs::File::create(target_directory.join(marker))?.sync_all()?;
+            }
+            for (name, text) in [
+                ("settings.gradle.kts", "include(\"backend\")"),
+                ("build.gradle.kts", "plugins { base }"),
+                (
+                    "backend/build.gradle.kts",
+                    "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                ),
+                ("gradle.properties", ""),
+                ("gradle/libs.versions.toml", ""),
+            ] {
+                let path = root.path().join(name);
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                let target = if name == redirected {
+                    target_directory.join("declaration")
+                } else {
+                    path.clone()
+                };
+                let mut file = std::fs::File::create(&target)?;
+                file.write_all(text.as_bytes())?;
+                file.sync_all()?;
+                if name == redirected {
+                    std::os::unix::fs::symlink(target, path)?;
+                }
+            }
+            let versions = resolve(root.path(), Duration::from_millis(30));
+            assert!(versions.kotlin.is_none(), "{redirected} / {boundary:?}");
+            assert!(versions.java.is_none(), "{redirected} / {boundary:?}");
+            root.close()?;
+            outside.close()?;
         }
         Ok(())
     }
