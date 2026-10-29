@@ -2549,11 +2549,13 @@ By default the module will be shown if any of the following conditions are met:
 
 ### Variables
 
-| Variable | Example | Description                          |
-| -------- | ------- | ------------------------------------ |
-| version  | `v14`   | The version of `java`                |
-| symbol   |         | Mirrors the value of option `symbol` |
-| style\*  |         | Mirrors the value of option `style`  |
+| Variable       | Example | Description                                                   |
+| -------------- | ------- | ------------------------------------------------------------- |
+| version        | `v14`   | The version of `java`                                         |
+| local_version  | `v21`   | The project-declared Java toolchain version (no commands run) |
+| target_version | `v25`   | The Maven release target (no commands run)                    |
+| symbol         |         | Mirrors the value of option `symbol`                          |
+| style\*        |         | Mirrors the value of option `style`                           |
 
 *: This variable can only be used as a part of a style string
 
@@ -2565,6 +2567,53 @@ By default the module will be shown if any of the following conditions are met:
 [java]
 symbol = '🌟 '
 ```
+
+### Project-declared version
+
+Use `$local_version` in your format to read the project's build files without
+starting Java, Kotlin, Gradle, or Maven. `$version` keeps reporting the installed
+version; including both variables still runs the installed-version command.
+The local version is a declaration, not verification of the compiler used by a build.
+Unresolved declarations produce no value, with no installed-version fallback.
+
+Supported declarations are Gradle's `java { toolchain { languageVersion =
+JavaLanguageVersion.of(21) } }`, Kotlin's `kotlin { jvmToolchain(21) }`, and Maven's
+`maven-compiler-plugin` configuration `<jdkToolchain><version>21</version></jdkToolchain>`.
+Only exact versions are shown. Compatibility settings (`release`, `sourceCompatibility`,
+`targetCompatibility`, and `jvmTarget`) are not compiler versions and do not populate `$local_version`.
+
+```toml
+[java]
+format = '(via [$symbol$local_version ]($style))(via [${symbol}target $target_version ]($style))'
+```
+
+For a Maven project that declares only `maven.compiler.release`, `$target_version`
+reports that release target separately. It supports exact numeric values and simple
+property references, including local parent properties. It does not select or verify
+a compiler. Compiler-plugin configuration or executions (including plugin management),
+profiles, and ambiguous properties leave the target unresolved. No commands run.
+The conditional groups above hide the whole segment when its value is unavailable.
+
+When `$local_version` or `$target_version` is requested, discovery also works from source subdirectories.
+It examines at most eight directory levels, stopping at a Git or Gradle settings
+boundary. The nearest build file takes precedence; Gradle plugin defaults can come
+from root build/settings files. Maven supports local parents at `../pom.xml`.
+A root containing only `plugins { base }` can use the declarations of one literal
+`include("module")` (or Groovy `include 'module'`) from its settings file. Colon-separated
+nested paths are supported. Settings must contain only that standalone include, a literal
+root name, and a small static subset of plugin/repository-management blocks. Interpolated
+or escaped strings, nested block-comment openers, arbitrary calls, conditional/qualified includes,
+module-directory aliases, descriptor remapping, and declaration files outside the root or
+across nested build/repository boundaries remain unresolved; no directory tree is scanned.
+Remote parents, active-profile evaluation, arbitrary Gradle expressions, convention
+plugins, and task-specific compiler overrides are not evaluated. Conflicting or
+unsupported version declarations are omitted rather than guessed.
+
+Reads are limited to 64 KiB per file and 512 KiB per resolution. Discovery checks a
+`scan_timeout` elapsed-time budget (30 ms by default) between operations; this is not a hard deadline for
+filesystem calls or OS scheduling. Java and Kotlin share the result within a prompt
+render, but nothing is cached between prompts, so edits are read on the next render.
+The default format and project detection are unchanged unless `$local_version` or `$target_version` is used.
 
 ## JJ Bookmark
 
@@ -2926,11 +2975,12 @@ By default the module will be shown if any of the following conditions are met:
 
 ### Variables
 
-| Variable | Example   | Description                          |
-| -------- | --------- | ------------------------------------ |
-| version  | `v1.4.21` | The version of `kotlin`              |
-| symbol   |           | Mirrors the value of option `symbol` |
-| style\*  |           | Mirrors the value of option `style`  |
+| Variable      | Example   | Description                                                    |
+| ------------- | --------- | -------------------------------------------------------------- |
+| version       | `v1.4.21` | The version of `kotlin`                                        |
+| local_version | `v2.1.20` | The project-declared Kotlin compiler version (no commands run) |
+| symbol        |           | Mirrors the value of option `symbol`                           |
+| style\*       |           | Mirrors the value of option `style`                            |
 
 *: This variable can only be used as a part of a style string
 
@@ -2950,6 +3000,46 @@ symbol = '🅺 '
 # Uses the Kotlin Compiler binary to get the installed version
 kotlin_binary = 'kotlinc'
 ```
+
+### Project-declared version
+
+Use `$local_version` in your format to read the project's build files without
+starting Java, Kotlin, Gradle, or Maven. `$version` keeps reporting the installed
+version; including both variables still runs the installed-version command.
+The local version is a declaration, not verification of the compiler used by a build.
+Unresolved declarations produce no value, with no installed-version fallback.
+
+Supported declarations are literal Kotlin plugin versions in Gradle's `plugins`
+block (`kotlin("jvm") version "2.1.20"` or `id("org.jetbrains.kotlin.jvm") version
+"2.1.20"`), default `libs.plugins` version-catalog aliases, and Maven's
+`org.jetbrains.kotlin:kotlin-maven-plugin` version. Simple property references
+are supported through `gradle.properties` and Maven `<properties>`.
+
+```toml
+[kotlin]
+format = '(via [$symbol$local_version ]($style))'
+```
+
+When `$local_version` is requested, discovery also works from source subdirectories.
+It examines at most eight directory levels, stopping at a Git or Gradle settings
+boundary. The nearest build file takes precedence; Gradle plugin defaults can come
+from root build/settings files. Maven supports local parents at `../pom.xml`.
+A root containing only `plugins { base }` can use the declarations of one literal
+`include("module")` (or Groovy `include 'module'`) from its settings file. Colon-separated
+nested paths are supported. Settings must contain only that standalone include, a literal
+root name, and a small static subset of plugin/repository-management blocks. Interpolated
+or escaped strings, nested block-comment openers, arbitrary calls, conditional/qualified includes,
+module-directory aliases, descriptor remapping, and declaration files outside the root or
+across nested build/repository boundaries remain unresolved; no directory tree is scanned.
+Remote parents, active-profile evaluation, arbitrary Gradle expressions, convention
+plugins, and task-specific compiler overrides are not evaluated. Conflicting or
+unsupported version declarations are omitted rather than guessed.
+
+Reads are limited to 64 KiB per file and 512 KiB per resolution. Discovery checks a
+`scan_timeout` elapsed-time budget (30 ms by default) between operations; this is not a hard deadline for
+filesystem calls or OS scheduling. Java and Kotlin share the result within a prompt
+render, but nothing is cached between prompts, so edits are read on the next render.
+The default format and project detection are unchanged unless `$local_version` is used.
 
 ## Kubernetes
 

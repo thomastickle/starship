@@ -1,0 +1,1911 @@
+//! A conservative reader of project declarations, never a build evaluator.
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use quick_xml::{Reader, events::Event};
+
+use crate::utils::read_file_with_limit;
+
+const FILE_LIMIT: u64 = 64 * 1024;
+const TOTAL_LIMIT: u64 = 512 * 1024;
+const MAX_DEPTH: usize = 8;
+
+#[derive(Default)]
+pub(crate) struct Versions {
+    pub kotlin: Option<String>,
+    pub java: Option<String>,
+    pub java_target: Option<String>,
+}
+
+struct Inputs {
+    start: Instant,
+    budget: Duration,
+    remaining: u64,
+    files: BTreeMap<PathBuf, Option<String>>,
+    failed: bool,
+    declaration_root: Option<PathBuf>,
+}
+
+impl Inputs {
+    fn new(budget: Duration) -> Self {
+        Self {
+            start: Instant::now(),
+            budget,
+            remaining: TOTAL_LIMIT,
+            files: BTreeMap::new(),
+            failed: false,
+            declaration_root: None,
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.start.elapsed() >= self.budget
+    }
+
+    fn restrict_declarations_to(&mut self, root: &Path) -> Option<()> {
+        // Cached inputs must satisfy the same boundary checks as subsequent reads.
+        if self
+            .files
+            .keys()
+            .any(|path| self.expired() || !declaration_in_root(root, path))
+        {
+            self.failed = true;
+            return None;
+        }
+        self.declaration_root = Some(root.to_path_buf());
+        Some(())
+    }
+
+    fn read(&mut self, path: PathBuf) -> Option<String> {
+        // A failed decode may already have consumed the remaining byte allowance.
+        // Stop before another read rather than accounting only for decoded strings.
+        if self.failed || self.expired() {
+            return None;
+        }
+        if self
+            .declaration_root
+            .as_ref()
+            .is_some_and(|root| !declaration_in_root(root, &path))
+        {
+            self.failed = true;
+            return None;
+        }
+        if let Some(contents) = self.files.get(&path) {
+            return contents.clone();
+        }
+        let contents = match read_file_with_limit(&path, FILE_LIMIT.min(self.remaining)) {
+            Ok(contents) => Some(contents),
+            Err(error) => {
+                self.failed |= error.kind() != std::io::ErrorKind::NotFound;
+                None
+            }
+        };
+        if let Some(contents) = &contents {
+            self.remaining -= contents.len() as u64;
+        }
+        self.files.insert(path, contents.clone());
+        contents
+    }
+}
+
+fn declaration_in_root(root: &Path, path: &Path) -> bool {
+    let actual = match dunce::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+    };
+    if !actual.starts_with(root) {
+        return false;
+    }
+    let Some(parent) = actual.parent() else {
+        return false;
+    };
+    for directory in parent.ancestors().take(MAX_DEPTH) {
+        if directory == root {
+            return true;
+        }
+        if [".git", "settings.gradle", "settings.gradle.kts"]
+            .iter()
+            .any(|name| directory.join(name).exists())
+        {
+            return false;
+        }
+    }
+    false
+}
+
+pub(super) fn resolve(directory: &Path, budget: Duration) -> Versions {
+    let mut inputs = Inputs::new(budget);
+    let versions = discover(directory, &mut inputs).unwrap_or_default();
+    // Never publish a partially resolved result after exhausting the cooperative budget.
+    if inputs.expired() || inputs.failed {
+        Versions::default()
+    } else {
+        versions
+    }
+}
+
+fn discover(directory: &Path, inputs: &mut Inputs) -> Option<Versions> {
+    let mut directories = Vec::new();
+    for directory in directory.ancestors().take(MAX_DEPTH) {
+        if inputs.expired() {
+            return None;
+        }
+        directories.push(directory);
+        if directory.join(".git").exists()
+            || directory.join("settings.gradle").exists()
+            || directory.join("settings.gradle.kts").exists()
+        {
+            break;
+        }
+    }
+    for (index, directory) in directories.iter().enumerate() {
+        let pom = inputs.read(directory.join("pom.xml"));
+        let groovy = inputs.read(directory.join("build.gradle"));
+        let kotlin = inputs.read(directory.join("build.gradle.kts"));
+        if pom.is_some() && (groovy.is_some() || kotlin.is_some())
+            || groovy.is_some() && kotlin.is_some()
+        {
+            return None;
+        }
+        if let Some(pom) = pom {
+            return maven(&pom, &directories[index..], inputs);
+        }
+        if let Some(build) = groovy.or(kotlin) {
+            return gradle(&build, &directories[index..], inputs);
+        }
+        // An existing but unreadable/oversized build must not fall back to a parent project.
+        if ["pom.xml", "build.gradle", "build.gradle.kts"]
+            .iter()
+            .any(|name| directory.join(name).exists())
+        {
+            return None;
+        }
+    }
+    None
+}
+
+fn exact_version(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.starts_with(|c: char| c.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+    {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
+fn unique(values: Vec<Option<String>>) -> Option<String> {
+    let mut values = values.into_iter();
+    let first = values.next()??;
+    values
+        .all(|value| value.as_ref() == Some(&first))
+        .then_some(first)
+}
+
+fn property(value: &str, properties: &BTreeMap<String, String>) -> Option<String> {
+    let mut value = value.trim().to_owned();
+    for _ in 0..MAX_DEPTH {
+        if let Some(key) = value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+            value = properties.get(key)?.clone();
+        } else {
+            return exact_version(&value);
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+enum BlockComments {
+    KotlinNested,
+    StaticRoot,
+}
+
+// Module parsing retains Kotlin's nesting rules. Root aggregation uses only
+// comments that are unambiguous across Groovy and Kotlin.
+fn tokens(input: &str, comments: BlockComments) -> Option<Vec<String>> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                let mut depth = 1;
+                while i + 1 < bytes.len() && depth > 0 {
+                    if &bytes[i..i + 2] == b"/*" {
+                        if matches!(comments, BlockComments::StaticRoot) {
+                            return None;
+                        }
+                        depth += 1;
+                        i += 2;
+                    } else if &bytes[i..i + 2] == b"*/" {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if depth != 0 {
+                    return None;
+                }
+                if matches!(comments, BlockComments::StaticRoot) {
+                    // Groovy block comments are newline tokens. Keeping that
+                    // separator avoids joining a method name with a later argument.
+                    out.push(";".into());
+                }
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return None;
+                }
+                i += 1;
+                out.push(input[start..i].to_owned());
+            }
+            b'\n' | b'\r' | b';' => {
+                out.push(";".into());
+                i += 1;
+            }
+            c if c.is_ascii_whitespace() => {
+                i += 1;
+            }
+            c if c.is_ascii_alphanumeric() || b"_.$-".contains(&c) => {
+                i += 1;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || b"_.$-".contains(&bytes[i]))
+                {
+                    i += 1;
+                }
+                out.push(input[start..i].to_owned());
+            }
+            c if c.is_ascii() => {
+                out.push((c as char).to_string());
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn unquote(value: &str) -> Option<&str> {
+    value
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+}
+
+fn gradle_value(value: &str, properties: &BTreeMap<String, String>) -> Option<String> {
+    if let Some(value) = unquote(value) {
+        property(value, properties)
+    } else {
+        property(properties.get(value)?, properties)
+    }
+}
+
+fn catalog_plugin<'a>(alias: &str, catalog: Option<&'a toml::Table>) -> Option<&'a toml::Value> {
+    let catalog = catalog?;
+    let plugins = catalog.get("plugins")?.as_table()?;
+    let mut matches = plugins
+        .iter()
+        .filter(|(key, _)| key.replace(['-', '_'], ".") == alias);
+    let (_, plugin) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(plugin)
+}
+
+fn catalog_version(plugin: &toml::Value, catalog: Option<&toml::Table>) -> Option<String> {
+    let catalog = catalog?;
+    let version = plugin.get("version")?;
+    if let Some(version) = version.as_str() {
+        return exact_version(version);
+    }
+    let key = version.get("ref")?.as_str()?;
+    exact_version(catalog.get("versions")?.get(key)?.as_str()?)
+}
+
+#[derive(Default)]
+struct GradleDeclarations {
+    kotlin: Vec<Option<String>>,
+    kotlin_unknown: bool,
+    defaults: Vec<Option<String>>,
+    java: Vec<Option<String>>,
+}
+
+fn gradle_declarations(
+    input: &str,
+    properties: &BTreeMap<String, String>,
+    catalog: Option<&toml::Table>,
+) -> Option<GradleDeclarations> {
+    let tokens = tokens(input, BlockComments::KotlinNested)?;
+    let mut out = GradleDeclarations::default();
+    let mut scopes = Vec::new();
+    let mut statement = Vec::new();
+    for token in tokens {
+        if token == "{" {
+            let scope = statement.join(" ");
+            scopes.push(scope);
+            if scopes.len() > 64 {
+                return None;
+            }
+            statement.clear();
+        } else if token == ";" || token == "}" {
+            gradle_statement(&statement, &scopes, properties, catalog, &mut out);
+            statement.clear();
+            if token == "}" {
+                scopes.pop()?;
+            }
+        } else {
+            statement.push(token);
+        }
+    }
+    if !scopes.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+fn gradle_statement(
+    statement: &[String],
+    scopes: &[String],
+    properties: &BTreeMap<String, String>,
+    catalog: Option<&toml::Table>,
+    out: &mut GradleDeclarations,
+) {
+    let s: Vec<&str> = statement.iter().map(String::as_str).collect();
+    let plugins = scopes == ["plugins"] || scopes == ["pluginManagement", "plugins"];
+    if plugins {
+        let mut rest = &s[..];
+        let mut alias = None;
+        let kotlin = match rest {
+            ["kotlin", "(", kind, ")", tail @ ..] if unquote(kind).is_some() => {
+                rest = tail;
+                true
+            }
+            ["id", "(", id, ")", tail @ ..] | ["id", id, tail @ ..]
+                if unquote(id).is_some_and(|id| id.starts_with("org.jetbrains.kotlin.")) =>
+            {
+                rest = tail;
+                true
+            }
+            ["alias", "(", name, ")", tail @ ..] if name.starts_with("libs.plugins.") => {
+                let plugin = catalog_plugin(&name[13..], catalog);
+                if plugin
+                    .and_then(|p| p.get("id"))
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|id| !id.starts_with("org.jetbrains.kotlin."))
+                {
+                    return;
+                }
+                alias = Some(plugin.and_then(|p| catalog_version(p, catalog)));
+                rest = tail;
+                true
+            }
+            _ => false,
+        };
+        if kotlin {
+            let needs_default = alias.is_none() && rest.is_empty();
+            let value = match rest {
+                [] | ["apply", "false"] => alias.flatten(),
+                ["version", value] | ["version", value, "apply", "false"] => {
+                    gradle_value(value, properties)
+                }
+                _ => None,
+            };
+            out.kotlin_unknown |= value.is_none() && !needs_default;
+            if rest.ends_with(&["apply", "false"]) || scopes.len() == 2 {
+                out.defaults.push(value);
+            } else {
+                out.kotlin.push(value);
+            }
+        }
+    }
+    if scopes == ["kotlin"] && s.first() == Some(&"jvmToolchain") {
+        out.java.push(match s.as_slice() {
+            ["jvmToolchain", "(", version, ")"] => exact_version(version),
+            _ => None,
+        });
+    }
+    if (scopes == ["java", "toolchain"] || scopes == ["kotlin", "jvmToolchain"])
+        && s.first()
+            .is_some_and(|word| word.starts_with("languageVersion"))
+    {
+        out.java.push(match s.as_slice() {
+            [
+                "languageVersion",
+                "=",
+                "JavaLanguageVersion.of",
+                "(",
+                version,
+                ")",
+            ]
+            | [
+                "languageVersion.set",
+                "(",
+                "JavaLanguageVersion.of",
+                "(",
+                version,
+                ")",
+                ")",
+            ] => exact_version(version),
+            _ => None,
+        });
+    }
+}
+
+/// Only a base-only root can borrow its sole module's declarations. Compiling or
+/// dynamically configured roots may select their own compiler independently.
+fn is_base_aggregator(build: &str) -> bool {
+    if build.contains('\\') {
+        return false;
+    }
+    tokens(build, BlockComments::StaticRoot).is_some_and(|tokens| {
+        tokens
+            .into_iter()
+            .filter(|token| token != ";")
+            .collect::<Vec<_>>()
+            == ["plugins", "{", "base", "}"]
+    })
+}
+
+fn included_module_path(name: &str) -> Option<PathBuf> {
+    let mut path = PathBuf::new();
+    let parts: Vec<_> = name.strip_prefix(':').unwrap_or(name).split(':').collect();
+    if parts.len() >= MAX_DEPTH {
+        return None;
+    }
+    for part in parts {
+        if part.is_empty()
+            || matches!(part, "." | "..")
+            || !part
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+        {
+            return None;
+        }
+        path.push(part);
+    }
+    Some(path)
+}
+
+fn static_settings_string(word: &str) -> bool {
+    unquote(word).is_some_and(|value| !value.contains(['$', '\\']))
+}
+
+fn static_settings_block(body: &[&str]) -> bool {
+    // These settings APIs configure repositories or default plugin coordinates.
+    // Arbitrary calls, reflection, dynamic method names, and expressions are not
+    // part of the static subset and could change the included project set.
+    let mut depth = 1_usize;
+    for (index, &word) in body.iter().enumerate() {
+        if unquote(word).is_some() {
+            if !static_settings_string(word)
+                || body.get(index + 1) == Some(&"(")
+                || index > 0 && (unquote(body[index - 1]).is_some() || body[index - 1] == ")")
+            {
+                return false;
+            }
+        } else if !matches!(
+            word,
+            "{" | "}"
+                | "("
+                | ")"
+                | "="
+                | ","
+                | "repositories"
+                | "gradlePluginPortal"
+                | "mavenCentral"
+                | "mavenLocal"
+                | "google"
+                | "maven"
+                | "url"
+                | "url.set"
+                | "uri"
+                | "credentials"
+                | "username"
+                | "password"
+                | "repositoriesMode.set"
+                | "RepositoriesMode.FAIL_ON_PROJECT_REPOS"
+                | "RepositoriesMode.PREFER_SETTINGS"
+                | "RepositoriesMode.PREFER_PROJECT"
+                | "plugins"
+                | "id"
+                | "kotlin"
+                | "version"
+        ) {
+            return false;
+        }
+        match word {
+            "{" => depth += 1,
+            "}" => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+            }
+            ")" if body.get(index + 1) == Some(&"(") => return false,
+            _ => (),
+        }
+        if depth == 0 && index + 1 != body.len() {
+            return false;
+        }
+    }
+    depth == 0
+}
+
+fn settings_statement(statement: &[&str], module: &mut Option<PathBuf>) -> Option<()> {
+    match statement {
+        [] => (),
+        ["include", "(", name, ")"] | ["include", name] => {
+            if module.is_some() {
+                return None;
+            }
+            *module = Some(included_module_path(unquote(name)?)?);
+        }
+        ["rootProject.name", "=", name] if unquote(name).is_some() => (),
+        [
+            "pluginManagement" | "dependencyResolutionManagement",
+            "{",
+            rest @ ..,
+        ] if rest.last() == Some(&"}") => {
+            if !static_settings_block(rest) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn single_gradle_module(settings: &str) -> Option<PathBuf> {
+    // Escape preprocessing differs between Groovy and Kotlin, including comments.
+    // Escaped source is outside this deliberately static settings subset.
+    if settings.contains('\\') {
+        return None;
+    }
+    let tokens = tokens(settings, BlockComments::StaticRoot)?;
+    let mut nesting = [0_usize; 3];
+    let mut statement = Vec::new();
+    let mut module = None;
+    for token in &tokens {
+        let word = token.as_str();
+        if unquote(word).is_some() && !static_settings_string(word) {
+            return None;
+        }
+        let method = word.rsplit('.').next()?;
+        // No conditional/qualified calls, composite builds, descriptor changes,
+        // or externally applied settings scripts can silently add/remap modules.
+        if matches!(
+            method,
+            "project" | "includeFlat" | "includeBuild" | "apply" | "projectDir" | "buildFileName"
+        ) || (method == "include" && word != "include")
+        {
+            return None;
+        }
+        if word == ";" {
+            if nesting == [0; 3] {
+                settings_statement(&statement, &mut module)?;
+                statement.clear();
+            }
+            continue;
+        }
+        let delimiter = match word {
+            "{" => Some((0, true)),
+            "}" => Some((0, false)),
+            "(" => Some((1, true)),
+            ")" => Some((1, false)),
+            "[" => Some((2, true)),
+            "]" => Some((2, false)),
+            _ => None,
+        };
+        if let Some((kind, opening)) = delimiter {
+            nesting[kind] = if opening {
+                nesting[kind].checked_add(1)?
+            } else {
+                nesting[kind].checked_sub(1)?
+            };
+            if nesting[kind] > 64 {
+                return None;
+            }
+        }
+        // Includes are accepted only as complete top-level statements, not from
+        // a known settings block's body or inside another call's arguments.
+        if word == "include" && nesting != [0; 3] {
+            return None;
+        }
+        statement.push(word);
+    }
+    if nesting != [0; 3] {
+        return None;
+    }
+    settings_statement(&statement, &mut module)?;
+    module
+}
+
+fn gradle_sole_module(root: &Path, inputs: &mut Inputs) -> Option<Versions> {
+    if inputs.failed || inputs.expired() {
+        return None;
+    }
+    let physical_root = dunce::canonicalize(root).ok()?;
+    inputs.restrict_declarations_to(&physical_root)?;
+    let settings = match (
+        inputs.read(root.join("settings.gradle.kts")),
+        inputs.read(root.join("settings.gradle")),
+    ) {
+        (Some(settings), None) | (None, Some(settings)) => settings,
+        _ => return None,
+    };
+    let relative = single_gradle_module(&settings)?;
+    if inputs.failed || inputs.expired() {
+        return None;
+    }
+    let module = dunce::canonicalize(root.join(&relative)).ok()?;
+    // Module directory aliases can change both ancestry and property inheritance.
+    // Stay with the default physical mapping instead of guessing their semantics.
+    if module != physical_root.join(relative) {
+        return None;
+    }
+    let mut directories: Vec<_> = module.ancestors().take(MAX_DEPTH).collect();
+    let root_index = directories
+        .iter()
+        .position(|directory| *directory == physical_root)?;
+    if directories[..root_index].iter().any(|directory| {
+        [".git", "settings.gradle", "settings.gradle.kts"]
+            .iter()
+            .any(|name| directory.join(name).exists())
+    }) {
+        return None;
+    }
+    directories.truncate(root_index + 1);
+    let build = match (
+        inputs.read(module.join("build.gradle.kts")),
+        inputs.read(module.join("build.gradle")),
+    ) {
+        (Some(build), None) | (None, Some(build)) => build,
+        _ => return None,
+    };
+    // The selected module must use the same unambiguous comment subset.
+    tokens(&build, BlockComments::StaticRoot)?;
+    // This is a single bounded hop; gradle sees a module below its root and cannot
+    // re-enter root aggregation. Input bytes and elapsed budget remain shared.
+    gradle(&build, &directories, inputs)
+}
+
+fn gradle(build: &str, directories: &[&Path], inputs: &mut Inputs) -> Option<Versions> {
+    let root_index = directories
+        .iter()
+        .position(|directory| {
+            directory.join("settings.gradle").exists()
+                || directory.join("settings.gradle.kts").exists()
+                || directory.join(".git").exists()
+        })
+        .unwrap_or(0);
+    let directories = &directories[..=root_index];
+    let root = *directories.last()?;
+    if root == directories[0] && is_base_aggregator(build) {
+        return gradle_sole_module(root, inputs);
+    }
+    let mut properties = BTreeMap::new();
+    // Module properties override root properties; these are declarations, not Gradle evaluation.
+    for directory in directories.iter().rev() {
+        if let Some(contents) = inputs.read(directory.join("gradle.properties")) {
+            for line in contents
+                .lines()
+                .filter(|line| !line.trim_start().starts_with(['#', '!']))
+            {
+                if let Some((key, value)) = line.split_once('=') {
+                    properties.insert(key.trim().into(), value.trim().into());
+                }
+            }
+        }
+    }
+    let catalog = inputs
+        .read(root.join("gradle/libs.versions.toml"))
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok());
+    let declarations = gradle_declarations(build, &properties, catalog.as_ref())?;
+    let kotlin = if declarations.kotlin_unknown || declarations.kotlin.is_empty() {
+        None
+    } else if declarations.kotlin.iter().all(Option::is_some) {
+        unique(declarations.kotlin)
+    } else {
+        let mut defaults = declarations.defaults;
+        for name in [
+            "settings.gradle",
+            "settings.gradle.kts",
+            "build.gradle",
+            "build.gradle.kts",
+        ] {
+            if let Some(text) = inputs.read(root.join(name)) {
+                let parsed = gradle_declarations(&text, &properties, catalog.as_ref())?;
+                defaults.extend(parsed.defaults);
+                if name.starts_with("build.") {
+                    if parsed.kotlin_unknown {
+                        defaults.push(None);
+                    } else {
+                        defaults.extend(parsed.kotlin.into_iter().filter(Option::is_some));
+                    }
+                }
+            }
+        }
+        let default = unique(defaults);
+        unique(
+            declarations
+                .kotlin
+                .into_iter()
+                .map(|value| value.or_else(|| default.clone()))
+                .collect(),
+        )
+    };
+    Some(Versions {
+        kotlin,
+        java: unique(declarations.java),
+        java_target: None,
+    })
+}
+
+#[derive(Default)]
+struct Element {
+    name: String,
+    text: String,
+    children: Vec<Self>,
+}
+
+impl Element {
+    fn child(&self, name: &str) -> Option<&Self> {
+        let mut matching = self.children.iter().filter(|child| child.name == name);
+        let child = matching.next()?;
+        matching.next().is_none().then_some(child)
+    }
+    fn at(&self, path: &[&str]) -> Option<&Self> {
+        path.iter()
+            .try_fold(self, |element, name| element.child(name))
+    }
+    fn text(&self, path: &[&str]) -> Option<&str> {
+        Some(self.at(path)?.text.trim())
+    }
+}
+
+fn xml(input: &str) -> Option<Element> {
+    let mut reader = Reader::from_str(input);
+    let mut stack = vec![Element::default()];
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(event) => {
+                if stack.len() >= 64 {
+                    return None;
+                }
+                stack.push(Element {
+                    name: event.name().as_ref().into(),
+                    ..Element::default()
+                });
+            }
+            Event::Empty(event) => {
+                stack.last_mut()?.children.push(Element {
+                    name: event.name().as_ref().into(),
+                    ..Element::default()
+                });
+            }
+            Event::End(_) => {
+                if stack.len() <= 1 {
+                    return None;
+                }
+                let element = stack.pop()?;
+                stack.last_mut()?.children.push(element);
+            }
+            Event::Text(event) => stack.last_mut()?.text.push_str(event.as_ref()),
+            Event::Eof => break,
+            Event::Decl(_) | Event::Comment(_) => (),
+            _ => return None,
+        }
+    }
+    if stack.len() != 1 {
+        return None;
+    }
+    let mut root = stack.pop()?;
+    if root.children.len() != 1 || root.children[0].name != "project" {
+        return None;
+    }
+    Some(root.children.remove(0))
+}
+
+fn maven(pom: &str, directories: &[&Path], inputs: &mut Inputs) -> Option<Versions> {
+    let mut projects = vec![xml(pom)?];
+    // Only explicit/default ../pom.xml parents within the discovery boundary are followed.
+    for pair in directories.windows(2) {
+        if projects.last()?.child("parent").is_none() {
+            break;
+        }
+        let parent = projects.last()?.child("parent")?;
+        if parent
+            .text(&["relativePath"])
+            .is_some_and(|path| path != "../pom.xml")
+        {
+            return None;
+        }
+        let parent_project = xml(&inputs.read(pair[1].join("pom.xml"))?)?;
+        for coordinate in ["groupId", "artifactId", "version"] {
+            let expected = parent.text(&[coordinate])?;
+            let actual = parent_project
+                .text(&[coordinate])
+                .or_else(|| parent_project.text(&["parent", coordinate]))?;
+            if expected != actual || expected.contains('$') {
+                return None;
+            }
+        }
+        projects.push(parent_project);
+    }
+    if projects.last()?.child("parent").is_some() {
+        return None;
+    }
+    if projects
+        .iter()
+        .any(|project| project.child("profiles").is_some())
+    {
+        return None;
+    }
+    let mut properties = BTreeMap::new();
+    for project in projects.iter().rev() {
+        if let Some(props) = project.child("properties") {
+            for prop in &props.children {
+                properties.insert(prop.name.clone(), prop.text.trim().to_owned());
+            }
+        }
+    }
+    let mut versions = Versions::default();
+    // Use the nearest declaration for each plugin, retaining conflicts in that declaration.
+    let mut kotlin_seen = false;
+    let mut java_seen = false;
+    for (project_index, project) in projects.iter().enumerate() {
+        let Some(plugins) = project.at(&["build", "plugins"]) else {
+            continue;
+        };
+        let mut kotlin = Vec::new();
+        let mut java = Vec::new();
+        for plugin in plugins
+            .children
+            .iter()
+            .filter(|plugin| plugin.name == "plugin")
+        {
+            let applies = project_index == 0 || plugin.text(&["inherited"]) != Some("false");
+            // Keep a suppressed declaration as unresolved so a more distant ancestor
+            // cannot resurrect a plugin excluded by the nearer parent's model.
+            match (plugin.text(&["groupId"]), plugin.text(&["artifactId"])) {
+                (Some("org.jetbrains.kotlin"), Some("kotlin-maven-plugin")) => {
+                    kotlin.push(if applies {
+                        plugin
+                            .text(&["version"])
+                            .and_then(|value| property(value, &properties))
+                    } else {
+                        None
+                    });
+                }
+                (None | Some("org.apache.maven.plugins"), Some("maven-compiler-plugin")) => {
+                    java.push(if applies {
+                        plugin
+                            .text(&["configuration", "jdkToolchain", "version"])
+                            .and_then(|value| property(value, &properties))
+                    } else {
+                        None
+                    });
+                }
+                _ => (),
+            }
+        }
+        if !kotlin_seen && !kotlin.is_empty() {
+            kotlin_seen = true;
+            versions.kotlin = unique(kotlin);
+        }
+        if !java_seen && !java.is_empty() {
+            java_seen = true;
+            versions.java = unique(java);
+        }
+    }
+    versions.java_target = maven_release_property(&projects, &properties);
+    Some(versions)
+}
+
+fn maven_release_property(
+    projects: &[Element],
+    properties: &BTreeMap<String, String>,
+) -> Option<String> {
+    // A property is useful without pretending to evaluate Maven's plugin model.
+    // Configuration, executions, and plugin management can override that property;
+    // leave those cases unresolved instead of displaying a potentially false target.
+    for project in projects {
+        if let Some(props) = project.child("properties") {
+            let mut names = std::collections::BTreeSet::new();
+            if props.children.iter().any(|prop| !names.insert(&prop.name)) {
+                return None;
+            }
+        }
+        for path in [
+            &["build", "plugins"][..],
+            &["build", "pluginManagement", "plugins"][..],
+        ] {
+            if let Some(plugins) = project.at(path) {
+                for plugin in &plugins.children {
+                    let compiler_plugin = plugin.name == "plugin"
+                        && plugin.text(&["artifactId"]) == Some("maven-compiler-plugin")
+                        && matches!(
+                            plugin.text(&["groupId"]),
+                            None | Some("org.apache.maven.plugins")
+                        );
+                    if compiler_plugin
+                        && plugin.children.iter().any(|child| {
+                            matches!(child.name.as_str(), "configuration" | "executions")
+                        })
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    let target = property(properties.get("maven.compiler.release")?, properties)?;
+    target
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then_some(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Write};
+
+    fn fixture(files: &[(&str, &str)], cwd: &str) -> io::Result<Versions> {
+        let dir = tempfile::tempdir()?;
+        for (name, contents) in files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            let mut file = std::fs::File::create(path)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+        }
+        let cwd = dir.path().join(cwd);
+        std::fs::create_dir_all(&cwd)?;
+        let versions = resolve(&cwd, Duration::from_millis(30));
+        dir.close()?;
+        Ok(versions)
+    }
+
+    #[test]
+    fn gradle_base_root_uses_its_single_declared_module() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                (
+                    "settings.gradle.kts",
+                    "pluginManagement { repositories { gradlePluginPortal(); mavenCentral() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { mavenCentral() } }\nrootProject.name = \"example\"\ninclude(\"backend\")",
+                ),
+                ("build.gradle.kts", "plugins { base }"),
+                (
+                    "backend/build.gradle.kts",
+                    "plugins { kotlin(\"jvm\") version \"2.4.0\" }\njava { toolchain { languageVersion.set(JavaLanguageVersion.of(25)) } }\nkotlin { jvmToolchain(25) }",
+                ),
+            ],
+            "",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.4.0"));
+        assert_eq!(versions.java.as_deref(), Some("25"));
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_base_root_can_follow_a_nested_groovy_module_path() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                ("settings.gradle", "include ':services:api'"),
+                ("build.gradle", "plugins { base }"),
+                (
+                    "services/api/build.gradle",
+                    "plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.0' }\nkotlin { jvmToolchain(25) }",
+                ),
+            ],
+            "",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.4.0"));
+        assert_eq!(versions.java.as_deref(), Some("25"));
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_base_root_does_not_guess_ambiguous_or_remapped_modules() -> io::Result<()> {
+        for settings in [
+            "include(\"backend\", \"other\")",
+            "include(\"backend\"); include(\"other\")",
+            "if (enabled) { include(\"backend\") }",
+            "include(moduleName)",
+            "include(\"back\" + \"end\")",
+            "include(\"backend\"); project(\":backend\").projectDir = file(\"other\")",
+            "include(\"backend\"); project(\":backend\").buildFileName = \"other.gradle.kts\"",
+            "includeFlat(\"backend\")",
+            "include(\"../backend\")",
+            "include(\":..:backend\")",
+            "include(\"backend\"); includeBuild(\"other\")",
+        ] {
+            let versions = fixture(
+                &[
+                    ("settings.gradle.kts", settings),
+                    ("build.gradle.kts", "plugins { base }"),
+                    (
+                        "backend/build.gradle.kts",
+                        "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                    ),
+                ],
+                "",
+            )?;
+            assert!(versions.kotlin.is_none(), "{settings}");
+            assert!(versions.java.is_none(), "{settings}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_root_requires_a_standalone_unconditional_include() -> io::Result<()> {
+        for settings in [
+            "if (false) include(\"backend\")",
+            "if (false)\ninclude(\"backend\")",
+            "enabled && include(\"backend\")",
+            "enabled &&\ninclude(\"backend\")",
+            "val result = include(\"backend\")",
+            "someCall(\ninclude(\"backend\")\n)",
+            "include(\"backend\")\nsettings.include(\"other\")",
+            "include(\"backend\")\nsettings.includeFlat(\"other\")",
+            "include(\"backend\")\nsettings.includeBuild(\"other\")",
+        ] {
+            let versions = fixture(
+                &[
+                    ("settings.gradle.kts", settings),
+                    ("build.gradle.kts", "plugins { base }"),
+                    (
+                        "backend/build.gradle.kts",
+                        "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                    ),
+                ],
+                "",
+            )?;
+            assert!(versions.kotlin.is_none(), "{settings}");
+            assert!(versions.java.is_none(), "{settings}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_root_rejects_interpolated_or_escaped_root_names() -> io::Result<()> {
+        for settings in [
+            r#"rootProject.name = "${include('other')}"
+include 'backend'"#,
+            r#"rootProject.name = "\u0024{include('other')}"
+include 'backend'"#,
+            r#"// \u000a include 'other'
+include 'backend'"#,
+        ] {
+            let versions = fixture(
+                &[
+                    ("settings.gradle", settings),
+                    ("build.gradle.kts", "plugins { base }"),
+                    (
+                        "backend/build.gradle.kts",
+                        "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                    ),
+                ],
+                "",
+            )?;
+            assert!(versions.kotlin.is_none(), "{settings}");
+            assert!(versions.java.is_none(), "{settings}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_root_rejects_executable_repository_settings() -> io::Result<()> {
+        for settings in [
+            r#"pluginManagement { repositories { maven { url = "${include('other')}" } } }
+include 'backend'"#,
+            r#"dependencyResolutionManagement { repositories { maven { url = "${include('other')}" } } }
+include 'backend'"#,
+            r#"pluginManagement { settings.invokeMethod('include', ['other']) }
+include 'backend'"#,
+            r#"pluginManagement { settings.'include'('other') }
+include 'backend'"#,
+            "include 'backend'\r// comment\rsettings.include 'other'",
+        ] {
+            let versions = fixture(
+                &[
+                    ("settings.gradle", settings),
+                    ("build.gradle.kts", "plugins { base }"),
+                    (
+                        "backend/build.gradle.kts",
+                        "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                    ),
+                ],
+                "",
+            )?;
+            assert!(versions.kotlin.is_none(), "{settings}");
+            assert!(versions.java.is_none(), "{settings}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gradle_root_cannot_follow_an_alias_under_a_nested_repository() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("other/child"))?;
+        for (name, text) in [
+            ("settings.gradle.kts", "include(\"backend\")"),
+            ("build.gradle.kts", "plugins { base }"),
+            ("other/.git", ""),
+            (
+                "other/child/build.gradle.kts",
+                "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+            ),
+        ] {
+            let mut file = std::fs::File::create(root.path().join(name))?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::os::unix::fs::symlink(root.path().join("other/child"), root.path().join("backend"))?;
+        let versions = resolve(root.path(), Duration::from_millis(30));
+        assert!(versions.kotlin.is_none());
+        assert!(versions.java.is_none());
+        root.close()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gradle_root_cannot_read_a_declaration_file_link_outside_the_build() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("backend"))?;
+        for (path, text) in [
+            (
+                root.path().join("settings.gradle.kts"),
+                "include(\"backend\")",
+            ),
+            (root.path().join("build.gradle.kts"), "plugins { base }"),
+            (
+                outside.path().join("build.gradle.kts"),
+                "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+            ),
+        ] {
+            let mut file = std::fs::File::create(path)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::os::unix::fs::symlink(
+            outside.path().join("build.gradle.kts"),
+            root.path().join("backend/build.gradle.kts"),
+        )?;
+        let versions = resolve(root.path(), Duration::from_millis(30));
+        assert!(versions.kotlin.is_none());
+        assert!(versions.java.is_none());
+        root.close()?;
+        outside.close()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gradle_aggregation_checks_all_declaration_files_and_cached_inputs() -> io::Result<()> {
+        for (redirected, boundary) in [
+            ("settings.gradle.kts", None),
+            ("build.gradle.kts", None),
+            ("backend/build.gradle.kts", None),
+            ("gradle.properties", None),
+            ("gradle/libs.versions.toml", None),
+            ("backend/build.gradle.kts", Some(".git")),
+            ("backend/build.gradle.kts", Some("settings.gradle.kts")),
+        ] {
+            let root = tempfile::tempdir()?;
+            let outside = tempfile::tempdir()?;
+            let target_directory = if boundary.is_some() {
+                root.path().join("nested")
+            } else {
+                outside.path().to_path_buf()
+            };
+            std::fs::create_dir_all(&target_directory)?;
+            if let Some(marker) = boundary {
+                std::fs::File::create(target_directory.join(marker))?.sync_all()?;
+            }
+            for (name, text) in [
+                ("settings.gradle.kts", "include(\"backend\")"),
+                ("build.gradle.kts", "plugins { base }"),
+                (
+                    "backend/build.gradle.kts",
+                    "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                ),
+                ("gradle.properties", ""),
+                ("gradle/libs.versions.toml", ""),
+            ] {
+                let path = root.path().join(name);
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                let target = if name == redirected {
+                    target_directory.join("declaration")
+                } else {
+                    path.clone()
+                };
+                let mut file = std::fs::File::create(&target)?;
+                file.write_all(text.as_bytes())?;
+                file.sync_all()?;
+                if name == redirected {
+                    std::os::unix::fs::symlink(target, path)?;
+                }
+            }
+            let versions = resolve(root.path(), Duration::from_millis(30));
+            assert!(versions.kotlin.is_none(), "{redirected} / {boundary:?}");
+            assert!(versions.java.is_none(), "{redirected} / {boundary:?}");
+            root.close()?;
+            outside.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_aggregation_rejects_nested_comment_openers() -> io::Result<()> {
+        for (settings, build) in [
+            (
+                "/* /* */ include 'other' // */\ninclude 'backend'",
+                "plugins { base }",
+            ),
+            (
+                "include 'backend'",
+                "/* /* */ plugins { java } // */\nplugins { base }",
+            ),
+            (
+                "/* outer /* inner */ outer */\ninclude 'backend'",
+                "plugins { base }",
+            ),
+            ("include /* separator */ 'backend'", "plugins { base }"),
+        ] {
+            let versions = fixture(
+                &[
+                    ("settings.gradle", settings),
+                    ("build.gradle", build),
+                    (
+                        "backend/build.gradle.kts",
+                        "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                    ),
+                ],
+                "",
+            )?;
+            assert!(versions.kotlin.is_none(), "{settings} / {build}");
+            assert!(versions.java.is_none(), "{settings} / {build}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_aggregation_rejects_nested_openers_in_the_selected_module() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                ("settings.gradle", "include 'backend'"),
+                ("build.gradle", "plugins { base }"),
+                (
+                    "backend/build.gradle",
+                    "plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.0' }\nkotlin { jvmToolchain(25) }\n/* /* */ kotlin { jvmToolchain(21) } // */",
+                ),
+            ],
+            "",
+        )?;
+        assert!(versions.kotlin.is_none());
+        assert!(versions.java.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_aggregation_accepts_ordinary_block_comments() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                (
+                    "settings.gradle",
+                    "/* a single module */\ninclude 'backend'",
+                ),
+                ("build.gradle", "/* aggregator */\nplugins { base }"),
+                (
+                    "backend/build.gradle.kts",
+                    "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                ),
+            ],
+            "",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.4.0"));
+        assert_eq!(versions.java.as_deref(), Some("25"));
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_kotlin_modules_keep_nested_block_comment_support() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                ("settings.gradle.kts", ""),
+                (
+                    "build.gradle.kts",
+                    "/* outer /* inner */ outer */\nplugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                ),
+            ],
+            "",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.4.0"));
+        assert_eq!(versions.java.as_deref(), Some("25"));
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_compiling_root_does_not_borrow_child_toolchains() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                ("settings.gradle.kts", "include(\"backend\")"),
+                ("build.gradle.kts", "plugins { java }"),
+                (
+                    "backend/build.gradle.kts",
+                    "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                ),
+            ],
+            "",
+        )?;
+        assert!(versions.kotlin.is_none());
+        assert!(versions.java.is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gradle_root_does_not_follow_a_module_symlink_outside_the_build() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        for (path, text) in [
+            (
+                root.path().join("settings.gradle.kts"),
+                "include(\"backend\")",
+            ),
+            (root.path().join("build.gradle.kts"), "plugins { base }"),
+            (
+                outside.path().join("build.gradle.kts"),
+                "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+            ),
+        ] {
+            let mut file = std::fs::File::create(path)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::os::unix::fs::symlink(outside.path(), root.path().join("backend"))?;
+        let versions = resolve(root.path(), Duration::from_millis(30));
+        assert!(versions.kotlin.is_none());
+        assert!(versions.java.is_none());
+        root.close()?;
+        outside.close()
+    }
+
+    #[test]
+    fn gradle_root_does_not_scan_unlisted_or_missing_modules() -> io::Result<()> {
+        for settings in ["", "include(\"missing\")"] {
+            let versions = fixture(
+                &[
+                    ("settings.gradle.kts", settings),
+                    ("build.gradle.kts", "plugins { base }"),
+                    (
+                        "backend/build.gradle.kts",
+                        "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                    ),
+                ],
+                "",
+            )?;
+            assert!(versions.kotlin.is_none());
+            assert!(versions.java.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_catalog_from_source_directory() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                ("settings.gradle.kts", "rootProject.name = \"sample\""),
+                (
+                    "build.gradle.kts",
+                    "plugins { alias(libs.plugins.kotlin.jvm) }\nkotlin { jvmToolchain(21) }",
+                ),
+                (
+                    "gradle/libs.versions.toml",
+                    "[versions]\nkotlin = '2.1.20'\n[plugins]\nkotlin-jvm = { id = 'org.jetbrains.kotlin.jvm', version.ref = 'kotlin' }",
+                ),
+            ],
+            "src/main/kotlin",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.1.20"));
+        assert_eq!(versions.java.as_deref(), Some("21"));
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_root_defaults_and_module_properties() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                (
+                    "settings.gradle",
+                    "pluginManagement { plugins { id 'org.jetbrains.kotlin.jvm' version '2.1.20' } }",
+                ),
+                (
+                    "app/build.gradle",
+                    "plugins { id 'org.jetbrains.kotlin.jvm' }",
+                ),
+            ],
+            "app/src",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.1.20"));
+        let versions = fixture(
+            &[
+                ("settings.gradle.kts", ""),
+                ("gradle.properties", "kotlinVersion=2.1.21"),
+                (
+                    "build.gradle.kts",
+                    "plugins { kotlin(\"jvm\") version \"${kotlinVersion}\" }",
+                ),
+            ],
+            "",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.1.21"));
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_ignores_comments_targets_and_unapplied_plugins() {
+        let declarations = gradle_declarations(
+            r#"
+            // plugins { kotlin("jvm") version "9.9.9" }
+            /* java { toolchain { languageVersion = JavaLanguageVersion.of(99) } } */
+            plugins { kotlin("jvm") version "2.1.20" apply false }
+            java { sourceCompatibility = JavaVersion.VERSION_17 }
+            tasks.named("compileKotlin") { jvmTarget = "17" }
+        "#,
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        assert!(declarations.kotlin.is_empty());
+        assert!(declarations.java.is_empty());
+    }
+
+    #[test]
+    fn gradle_conflicting_and_computed_versions_are_unresolved() -> io::Result<()> {
+        for build in [
+            "plugins { kotlin(\"jvm\") version computeVersion() }",
+            "plugins { kotlin(\"jvm\") version \"2.1.20\" + suffix }",
+            "plugins { kotlin(\"jvm\") version \"2.1.20\"; kotlin(\"plugin.serialization\") version \"2.1.21\" }",
+        ] {
+            let versions = fixture(
+                &[("settings.gradle.kts", ""), ("build.gradle.kts", build)],
+                "",
+            )?;
+            assert!(versions.kotlin.is_none(), "{build}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn computed_module_version_must_not_use_root_default() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                (
+                    "settings.gradle.kts",
+                    "pluginManagement { plugins { kotlin(\"jvm\") version \"2.1.20\" } }",
+                ),
+                (
+                    "app/build.gradle.kts",
+                    "plugins { kotlin(\"jvm\") version computeVersion() }",
+                ),
+            ],
+            "app",
+        )?;
+        assert!(versions.kotlin.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn root_build_can_use_settings_plugin_defaults() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                (
+                    "settings.gradle.kts",
+                    "pluginManagement { plugins { kotlin(\"jvm\") version \"2.1.20\" } }",
+                ),
+                ("build.gradle.kts", "plugins { kotlin(\"jvm\") }"),
+            ],
+            "",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.1.20"));
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_build_uses_its_own_catalog() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                (
+                    "build.gradle.kts",
+                    "plugins { alias(libs.plugins.kotlin.jvm) }",
+                ),
+                (
+                    "gradle/libs.versions.toml",
+                    "[plugins]\nkotlin-jvm = { id = 'org.jetbrains.kotlin.jvm', version = '2.1.20' }",
+                ),
+            ],
+            "src",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.1.20"));
+        Ok(())
+    }
+
+    #[test]
+    fn non_kotlin_catalog_plugins_do_not_hide_kotlin() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                ("settings.gradle.kts", ""),
+                (
+                    "build.gradle.kts",
+                    "plugins { alias(libs.plugins.android); alias(libs.plugins.kotlin.jvm) }",
+                ),
+                (
+                    "gradle/libs.versions.toml",
+                    "[plugins]\nandroid = { id = 'com.android.application', version = '8.9.0' }\nkotlin-jvm = { id = 'org.jetbrains.kotlin.jvm', version = '2.1.20' }",
+                ),
+            ],
+            "",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.1.20"));
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_local_maven_parent_is_not_used() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                (".git", ""),
+                (
+                    "pom.xml",
+                    "<project><groupId>wrong</groupId><artifactId>parent</artifactId><version>1</version><properties><kotlin.version>9.9.9</kotlin.version></properties></project>",
+                ),
+                (
+                    "app/pom.xml",
+                    "<project><parent><groupId>expected</groupId><artifactId>parent</artifactId><version>1</version></parent><build><plugins><plugin><groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-maven-plugin</artifactId><version>${kotlin.version}</version></plugin></plugins></build></project>",
+                ),
+            ],
+            "app",
+        )?;
+        assert!(versions.kotlin.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn non_inherited_maven_plugins_apply_only_in_the_declaring_project() -> io::Result<()> {
+        let parent = r#"<project><groupId>example</groupId><artifactId>parent</artifactId><version>1</version><build><plugins>
+            <plugin><groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-maven-plugin</artifactId><version>2.1.20</version><inherited>false</inherited></plugin>
+            <plugin><artifactId>maven-compiler-plugin</artifactId><inherited>false</inherited><configuration><jdkToolchain><version>21</version></jdkToolchain></configuration></plugin>
+            </plugins></build></project>"#;
+        let child = "<project><parent><groupId>example</groupId><artifactId>parent</artifactId><version>1</version></parent></project>";
+        let files = [(".git", ""), ("pom.xml", parent), ("app/pom.xml", child)];
+        let versions = fixture(&files, "app")?;
+        assert!(versions.kotlin.is_none(), "Kotlin plugin is not inherited");
+        assert!(
+            versions.java.is_none(),
+            "Java plugin configuration is not inherited"
+        );
+        let versions = fixture(&files, "")?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.1.20"));
+        assert_eq!(versions.java.as_deref(), Some("21"));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_reads_stop_further_input_work() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let invalid = dir.path().join("gradle.properties");
+        let mut file = std::fs::File::create(&invalid)?;
+        file.write_all(&vec![0xff; FILE_LIMIT as usize])?;
+        file.sync_all()?;
+        let valid = dir.path().join("build.gradle.kts");
+        let mut file = std::fs::File::create(&valid)?;
+        file.write_all(b"plugins { kotlin(\"jvm\") version \"2.1.20\" }")?;
+        file.sync_all()?;
+        let mut inputs = Inputs::new(Duration::from_secs(1));
+        assert!(inputs.read(invalid).is_none());
+        assert!(inputs.failed);
+        assert!(
+            inputs.read(valid).is_none(),
+            "A fatal read error must prevent additional reads"
+        );
+        dir.close()
+    }
+
+    #[test]
+    fn invalid_utf8_cannot_repeat_reads_across_the_aggregate_budget() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::File::create(dir.path().join(".git"))?.sync_all()?;
+        let mut module = dir.path().to_path_buf();
+        for level in 0..MAX_DEPTH {
+            std::fs::create_dir_all(&module)?;
+            let mut file = std::fs::File::create(module.join("gradle.properties"))?;
+            file.write_all(&vec![0xff; FILE_LIMIT as usize])?;
+            file.sync_all()?;
+            if level + 1 < MAX_DEPTH {
+                module.push("app");
+            }
+        }
+        let mut file = std::fs::File::create(module.join("build.gradle.kts"))?;
+        file.write_all(b"plugins { kotlin(\"jvm\") version \"2.1.20\" }")?;
+        file.sync_all()?;
+        let mut inputs = Inputs::new(Duration::from_secs(1));
+        let _ = discover(&module, &mut inputs);
+        assert!(inputs.failed);
+        let attempted_properties = inputs
+            .files
+            .keys()
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == "gradle.properties")
+            })
+            .count();
+        assert_eq!(
+            attempted_properties, 1,
+            "Do not consume eight invalid files after the first fatal decode"
+        );
+        dir.close()
+    }
+
+    #[test]
+    fn non_inherited_maven_plugins_do_not_resurface_from_grandparents() -> io::Result<()> {
+        let grandparent = r#"<project><groupId>example</groupId><artifactId>root</artifactId><version>1</version><build><plugins>
+            <plugin><groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-maven-plugin</artifactId><version>2.2.0</version></plugin>
+            <plugin><artifactId>maven-compiler-plugin</artifactId><configuration><jdkToolchain><version>25</version></jdkToolchain></configuration></plugin>
+            </plugins></build></project>"#;
+        let parent = r#"<project><parent><groupId>example</groupId><artifactId>root</artifactId><version>1</version></parent><artifactId>parent</artifactId><build><plugins>
+            <plugin><groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-maven-plugin</artifactId><version>2.1.20</version><inherited>false</inherited></plugin>
+            <plugin><artifactId>maven-compiler-plugin</artifactId><inherited>false</inherited><configuration><jdkToolchain><version>21</version></jdkToolchain></configuration></plugin>
+            </plugins></build></project>"#;
+        let child = "<project><parent><groupId>example</groupId><artifactId>parent</artifactId><version>1</version></parent></project>";
+        let versions = fixture(
+            &[
+                (".git", ""),
+                ("pom.xml", grandparent),
+                ("app/pom.xml", parent),
+                ("app/child/pom.xml", child),
+            ],
+            "app/child",
+        )?;
+        assert!(versions.kotlin.is_none());
+        assert!(versions.java.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn maven_plugins_and_properties_from_local_parent() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                (
+                    "pom.xml",
+                    r#"<project><groupId>sample</groupId><artifactId>parent</artifactId><version>1</version><properties><kotlin.version>2.1.20</kotlin.version><jdk.version>21</jdk.version></properties></project>"#,
+                ),
+                (
+                    "app/pom.xml",
+                    r#"<project><parent><groupId>sample</groupId><artifactId>parent</artifactId><version>1</version></parent><build><plugins>
+                <plugin><groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-maven-plugin</artifactId><version>${kotlin.version}</version></plugin>
+                <plugin><artifactId>maven-compiler-plugin</artifactId><configuration><jdkToolchain><version>${jdk.version}</version></jdkToolchain></configuration></plugin>
+                </plugins></build></project>"#,
+                ),
+                (".git", "gitdir: unused"),
+            ],
+            "app/src/main",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.1.20"));
+        assert_eq!(versions.java.as_deref(), Some("21"));
+        Ok(())
+    }
+
+    #[test]
+    fn maven_does_not_confuse_targets_dependencies_or_plugin_management() -> io::Result<()> {
+        let versions = fixture(
+            &[(
+                "pom.xml",
+                r#"<project><version>9.9.9</version>
+            <properties><maven.compiler.release>17</maven.compiler.release></properties>
+            <dependencies><dependency><artifactId>kotlin-stdlib</artifactId><version>9.9.9</version></dependency></dependencies>
+            <build><pluginManagement><plugins><plugin><groupId>org.jetbrains.kotlin</groupId><artifactId>kotlin-maven-plugin</artifactId><version>9.9.9</version></plugin></plugins></pluginManagement></build>
+            </project>"#,
+            )],
+            "",
+        )?;
+        assert!(versions.kotlin.is_none());
+        assert!(versions.java.is_none());
+        assert_eq!(versions.java_target.as_deref(), Some("17"));
+        Ok(())
+    }
+
+    #[test]
+    fn maven_release_property_follows_local_parent_and_child_properties() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                (".git", ""),
+                (
+                    "pom.xml",
+                    "<project><groupId>example</groupId><artifactId>parent</artifactId><version>1</version><properties><maven.compiler.release>${java.release}</maven.compiler.release><java.release>21</java.release></properties></project>",
+                ),
+                (
+                    "app/pom.xml",
+                    "<project><parent><groupId>example</groupId><artifactId>parent</artifactId><version>1</version></parent><properties><java.release>25</java.release></properties></project>",
+                ),
+            ],
+            "app/src/main/java",
+        )?;
+        assert_eq!(versions.java_target.as_deref(), Some("25"));
+        assert!(versions.java.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn maven_release_property_rejects_possible_plugin_overrides() -> io::Result<()> {
+        for plugin in [
+            "<configuration><release>17</release></configuration>",
+            "<configuration><release>${unknown}</release></configuration>",
+            "<executions><execution><configuration><release>17</release></configuration></execution></executions>",
+        ] {
+            for container in [
+                "<plugins>{}</plugins>",
+                "<pluginManagement><plugins>{}</plugins></pluginManagement>",
+            ] {
+                let plugin = format!(
+                    "<plugin><artifactId>maven-compiler-plugin</artifactId>{plugin}</plugin>"
+                );
+                let build = container.replace("{}", &plugin);
+                let pom = format!(
+                    "<project><properties><maven.compiler.release>25</maven.compiler.release></properties><build>{build}</build></project>"
+                );
+                let versions = fixture(&[("pom.xml", &pom)], "")?;
+                assert!(versions.java_target.is_none(), "{pom}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn maven_release_property_rejects_ambiguous_and_non_numeric_values() -> io::Result<()> {
+        for value in [
+            "${missing}",
+            "${maven.compiler.release}",
+            "25-ea",
+            "[21,)",
+            "",
+        ] {
+            let pom = format!(
+                "<project><properties><maven.compiler.release>{value}</maven.compiler.release></properties></project>"
+            );
+            assert!(fixture(&[("pom.xml", &pom)], "")?.java_target.is_none());
+        }
+        for pom in [
+            "<project><properties><maven.compiler.release>25</maven.compiler.release><maven.compiler.release>17</maven.compiler.release></properties></project>",
+            "<project><properties><maven.compiler.release>25</maven.compiler.release></properties><profiles/></project>",
+        ] {
+            assert!(fixture(&[("pom.xml", pom)], "")?.java_target.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_or_profile_dependent_maven_is_unresolved() -> io::Result<()> {
+        for pom in [
+            "<project><build></project>",
+            "<project><profiles/></project>",
+            "<!DOCTYPE project><project/>",
+        ] {
+            let versions = fixture(&[("pom.xml", pom)], "")?;
+            assert!(versions.kotlin.is_none());
+            assert!(versions.java.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_or_oversized_nearer_build_does_not_use_parent() -> io::Result<()> {
+        let large = " ".repeat(FILE_LIMIT as usize + 1);
+        let versions = fixture(
+            &[
+                ("settings.gradle.kts", ""),
+                (
+                    "build.gradle.kts",
+                    "plugins { kotlin(\"jvm\") version \"2.1.20\" }",
+                ),
+                ("app/build.gradle.kts", &large),
+            ],
+            "app",
+        )?;
+        assert!(versions.kotlin.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn git_boundary_and_depth_prevent_unrelated_parent_detection() -> io::Result<()> {
+        for (marker, cwd) in [("app/.git", "app/src"), ("other", "a/b/c/d/e/f/g/h/i")] {
+            let versions = fixture(
+                &[
+                    (
+                        "build.gradle.kts",
+                        "plugins { kotlin(\"jvm\") version \"2.1.20\" }",
+                    ),
+                    (marker, ""),
+                ],
+                cwd,
+            )?;
+            assert!(versions.kotlin.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn file_edits_are_visible_on_the_next_render() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let build = dir.path().join("build.gradle.kts");
+        for version in ["2.1.20", "2.1.21"] {
+            let mut file = std::fs::File::create(&build)?;
+            write!(file, "plugins {{ kotlin(\"jvm\") version \"{version}\" }}")?;
+            file.sync_all()?;
+            assert_eq!(
+                resolve(dir.path(), Duration::from_millis(30))
+                    .kotlin
+                    .as_deref(),
+                Some(version)
+            );
+        }
+        std::fs::remove_file(build)?;
+        assert!(
+            resolve(dir.path(), Duration::from_millis(30))
+                .kotlin
+                .is_none()
+        );
+        dir.close()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_pipe_input_does_not_block_resolution() -> io::Result<()> {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+        let dir = tempfile::tempdir()?;
+        mkfifo(
+            &dir.path().join("build.gradle.kts"),
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )?;
+        assert!(
+            resolve(dir.path(), Duration::from_millis(30))
+                .kotlin
+                .is_none()
+        );
+        dir.close()
+    }
+
+    #[test]
+    fn budget_exhaustion_and_property_cycles_are_unresolved() {
+        let mut inputs = Inputs::new(Duration::from_millis(30));
+        inputs.start = Instant::now() - Duration::from_secs(1);
+        assert!(discover(Path::new("."), &mut inputs).is_none());
+        let properties = BTreeMap::from([("a".into(), "${b}".into()), ("b".into(), "${a}".into())]);
+        assert!(property("${a}", &properties).is_none());
+        assert!(exact_version("[17,22)").is_none());
+    }
+}
