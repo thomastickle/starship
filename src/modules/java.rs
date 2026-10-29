@@ -18,7 +18,11 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
     let wants_local = formatter
         .as_ref()
         .is_ok_and(|formatter| formatter.get_variables().contains("local_version"));
-    let local_project = wants_local && context.jvm_versions().java.is_some();
+    let wants_target = formatter
+        .as_ref()
+        .is_ok_and(|formatter| formatter.get_variables().contains("target_version"));
+    let local_project = (wants_local && context.jvm_versions().java.is_some())
+        || (wants_target && context.jvm_versions().java_target.is_some());
 
     let is_java_project = local_project
         || context
@@ -55,6 +59,12 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
                 "local_version" => VersionFormatter::format_module_version(
                     module.get_name(),
                     context.jvm_versions().java.as_deref()?,
+                    config.version_format,
+                )
+                .map(Ok),
+                "target_version" => VersionFormatter::format_module_version(
+                    module.get_name(),
+                    context.jvm_versions().java_target.as_deref()?,
                     config.version_format,
                 )
                 .map(Ok),
@@ -108,6 +118,41 @@ mod tests {
     use nu_ansi_term::Color;
     use std::fs::File;
     use std::io;
+
+    #[test]
+    fn maven_release_target_is_labelled_without_running_java() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("pom.xml"),
+            "<project><properties><maven.compiler.release>25</maven.compiler.release></properties></project>",
+        )?;
+        let source = dir.path().join("src/main/java");
+        std::fs::create_dir_all(&source)?;
+        let actual = ModuleRenderer::new("java")
+            .path(&source)
+            .config(toml::toml! { [java]
+                format = r"(\[[$symbol$local_version]($style)\])(\[[${symbol}target $target_version]($style)\])"
+                style = ""
+            })
+            .cmd("java -Xinternalversion", None)
+            .collect();
+        assert_eq!(actual.as_deref(), Some("[☕ target v25]"));
+        dir.close()
+    }
+
+    #[test]
+    fn conditional_local_prompt_hides_unknown_java_versions() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("pom.xml"), "<project/>")?;
+        let actual = ModuleRenderer::new("java")
+            .path(dir.path())
+            .config(toml::toml! { [java]
+                format = r"(\[[$symbol$local_version]($style)\])(\[[${symbol}target $target_version]($style)\])"
+            })
+            .collect();
+        assert_eq!(actual, None);
+        dir.close()
+    }
 
     #[test]
     fn local_and_installed_versions_remain_distinct() -> io::Result<()> {

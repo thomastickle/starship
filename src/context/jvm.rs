@@ -15,6 +15,7 @@ const MAX_DEPTH: usize = 8;
 pub(crate) struct Versions {
     pub kotlin: Option<String>,
     pub java: Option<String>,
+    pub java_target: Option<String>,
 }
 
 struct Inputs {
@@ -757,6 +758,7 @@ fn gradle(build: &str, directories: &[&Path], inputs: &mut Inputs) -> Option<Ver
     Some(Versions {
         kotlin,
         java: unique(declarations.java),
+        java_target: None,
     })
 }
 
@@ -917,7 +919,52 @@ fn maven(pom: &str, directories: &[&Path], inputs: &mut Inputs) -> Option<Versio
             versions.java = unique(java);
         }
     }
+    versions.java_target = maven_release_property(&projects, &properties);
     Some(versions)
+}
+
+fn maven_release_property(
+    projects: &[Element],
+    properties: &BTreeMap<String, String>,
+) -> Option<String> {
+    // A property is useful without pretending to evaluate Maven's plugin model.
+    // Configuration, executions, and plugin management can override that property;
+    // leave those cases unresolved instead of displaying a potentially false target.
+    for project in projects {
+        if let Some(props) = project.child("properties") {
+            let mut names = std::collections::BTreeSet::new();
+            if props.children.iter().any(|prop| !names.insert(&prop.name)) {
+                return None;
+            }
+        }
+        for path in [
+            &["build", "plugins"][..],
+            &["build", "pluginManagement", "plugins"][..],
+        ] {
+            if let Some(plugins) = project.at(path) {
+                for plugin in &plugins.children {
+                    let compiler_plugin = plugin.name == "plugin"
+                        && plugin.text(&["artifactId"]) == Some("maven-compiler-plugin")
+                        && matches!(
+                            plugin.text(&["groupId"]),
+                            None | Some("org.apache.maven.plugins")
+                        );
+                    if compiler_plugin
+                        && plugin.children.iter().any(|child| {
+                            matches!(child.name.as_str(), "configuration" | "executions")
+                        })
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    let target = property(properties.get("maven.compiler.release")?, properties)?;
+    target
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then_some(target)
 }
 
 #[cfg(test)]
@@ -1688,6 +1735,76 @@ include 'backend'"#,
         )?;
         assert!(versions.kotlin.is_none());
         assert!(versions.java.is_none());
+        assert_eq!(versions.java_target.as_deref(), Some("17"));
+        Ok(())
+    }
+
+    #[test]
+    fn maven_release_property_follows_local_parent_and_child_properties() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                (".git", ""),
+                (
+                    "pom.xml",
+                    "<project><groupId>example</groupId><artifactId>parent</artifactId><version>1</version><properties><maven.compiler.release>${java.release}</maven.compiler.release><java.release>21</java.release></properties></project>",
+                ),
+                (
+                    "app/pom.xml",
+                    "<project><parent><groupId>example</groupId><artifactId>parent</artifactId><version>1</version></parent><properties><java.release>25</java.release></properties></project>",
+                ),
+            ],
+            "app/src/main/java",
+        )?;
+        assert_eq!(versions.java_target.as_deref(), Some("25"));
+        assert!(versions.java.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn maven_release_property_rejects_possible_plugin_overrides() -> io::Result<()> {
+        for plugin in [
+            "<configuration><release>17</release></configuration>",
+            "<configuration><release>${unknown}</release></configuration>",
+            "<executions><execution><configuration><release>17</release></configuration></execution></executions>",
+        ] {
+            for container in [
+                "<plugins>{}</plugins>",
+                "<pluginManagement><plugins>{}</plugins></pluginManagement>",
+            ] {
+                let plugin = format!(
+                    "<plugin><artifactId>maven-compiler-plugin</artifactId>{plugin}</plugin>"
+                );
+                let build = container.replace("{}", &plugin);
+                let pom = format!(
+                    "<project><properties><maven.compiler.release>25</maven.compiler.release></properties><build>{build}</build></project>"
+                );
+                let versions = fixture(&[("pom.xml", &pom)], "")?;
+                assert!(versions.java_target.is_none(), "{pom}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn maven_release_property_rejects_ambiguous_and_non_numeric_values() -> io::Result<()> {
+        for value in [
+            "${missing}",
+            "${maven.compiler.release}",
+            "25-ea",
+            "[21,)",
+            "",
+        ] {
+            let pom = format!(
+                "<project><properties><maven.compiler.release>{value}</maven.compiler.release></properties></project>"
+            );
+            assert!(fixture(&[("pom.xml", &pom)], "")?.java_target.is_none());
+        }
+        for pom in [
+            "<project><properties><maven.compiler.release>25</maven.compiler.release><maven.compiler.release>17</maven.compiler.release></properties></project>",
+            "<project><properties><maven.compiler.release>25</maven.compiler.release></properties><profiles/></project>",
+        ] {
+            assert!(fixture(&[("pom.xml", pom)], "")?.java_target.is_none());
+        }
         Ok(())
     }
 

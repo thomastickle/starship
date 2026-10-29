@@ -132,6 +132,20 @@ mod tests {
     }
 
     #[test]
+    fn conditional_local_prompt_hides_unknown_kotlin_versions() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("build.gradle.kts"), "// No version")?;
+        let actual = ModuleRenderer::new("kotlin")
+            .path(dir.path())
+            .config(toml::toml! { [kotlin]
+                format = r"(\[[$symbol$local_version]($style)\])"
+            })
+            .collect();
+        assert_eq!(actual, None);
+        dir.close()
+    }
+
+    #[test]
     fn local_version_uses_project_declaration_without_installed_compiler() -> io::Result<()> {
         let dir = tempfile::tempdir()?;
         std::fs::write(

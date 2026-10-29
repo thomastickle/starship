@@ -2549,12 +2549,13 @@ By default the module will be shown if any of the following conditions are met:
 
 ### Variables
 
-| Variable      | Example | Description                                                   |
-| ------------- | ------- | ------------------------------------------------------------- |
-| version       | `v14`   | The version of `java`                                         |
-| local_version | `v21`   | The project-declared Java toolchain version (no commands run) |
-| symbol        |         | Mirrors the value of option `symbol`                          |
-| style\*       |         | Mirrors the value of option `style`                           |
+| Variable       | Example | Description                                                   |
+| -------------- | ------- | ------------------------------------------------------------- |
+| version        | `v14`   | The version of `java`                                         |
+| local_version  | `v21`   | The project-declared Java toolchain version (no commands run) |
+| target_version | `v25`   | The Maven release target (no commands run)                    |
+| symbol         |         | Mirrors the value of option `symbol`                          |
+| style\*        |         | Mirrors the value of option `style`                           |
 
 *: This variable can only be used as a part of a style string
 
@@ -2579,14 +2580,21 @@ Supported declarations are Gradle's `java { toolchain { languageVersion =
 JavaLanguageVersion.of(21) } }`, Kotlin's `kotlin { jvmToolchain(21) }`, and Maven's
 `maven-compiler-plugin` configuration `<jdkToolchain><version>21</version></jdkToolchain>`.
 Only exact versions are shown. Compatibility settings (`release`, `sourceCompatibility`,
-`targetCompatibility`, and `jvmTarget`) are not compiler versions and are ignored.
+`targetCompatibility`, and `jvmTarget`) are not compiler versions and do not populate `$local_version`.
 
 ```toml
 [java]
-format = 'via [$symbol($local_version )]($style)'
+format = '(via [$symbol$local_version ]($style))(via [${symbol}target $target_version ]($style))'
 ```
 
-When `$local_version` is requested, discovery also works from source subdirectories.
+For a Maven project that declares only `maven.compiler.release`, `$target_version`
+reports that release target separately. It supports exact numeric values and simple
+property references, including local parent properties. It does not select or verify
+a compiler. Compiler-plugin configuration or executions (including plugin management),
+profiles, and ambiguous properties leave the target unresolved. No commands run.
+The conditional groups above hide the whole segment when its value is unavailable.
+
+When `$local_version` or `$target_version` is requested, discovery also works from source subdirectories.
 It examines at most eight directory levels, stopping at a Git or Gradle settings
 boundary. The nearest build file takes precedence; Gradle plugin defaults can come
 from root build/settings files. Maven supports local parents at `../pom.xml`.
@@ -2605,7 +2613,7 @@ Reads are limited to 64 KiB per file and 512 KiB per resolution. Discovery check
 `scan_timeout` elapsed-time budget (30 ms by default) between operations; this is not a hard deadline for
 filesystem calls or OS scheduling. Java and Kotlin share the result within a prompt
 render, but nothing is cached between prompts, so edits are read on the next render.
-The default format and project detection are unchanged unless `$local_version` is used.
+The default format and project detection are unchanged unless `$local_version` or `$target_version` is used.
 
 ## JJ Bookmark
 
@@ -3009,7 +3017,7 @@ are supported through `gradle.properties` and Maven `<properties>`.
 
 ```toml
 [kotlin]
-format = 'via [$symbol($local_version )]($style)'
+format = '(via [$symbol$local_version ]($style))'
 ```
 
 When `$local_version` is requested, discovery also works from source subdirectories.
