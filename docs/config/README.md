@@ -2590,6 +2590,10 @@ When `$local_version` is requested, discovery also works from source subdirector
 It examines at most eight directory levels, stopping at a Git or Gradle settings
 boundary. The nearest build file takes precedence; Gradle plugin defaults can come
 from root build/settings files. Maven supports local parents at `../pom.xml`.
+A root containing only `plugins { base }` can use the declarations of one literal
+`include("module")` (or Groovy `include 'module'`) from its settings file. Colon-separated
+nested paths are supported. Multiple/dynamic modules, project directory/build-file
+remapping, and child paths outside the root remain unresolved; no directory tree is scanned.
 Remote parents, active-profile evaluation, arbitrary Gradle expressions, convention
 plugins, and task-specific compiler overrides are not evaluated. Conflicting or
 unsupported version declarations are omitted rather than guessed.
@@ -3009,6 +3013,10 @@ When `$local_version` is requested, discovery also works from source subdirector
 It examines at most eight directory levels, stopping at a Git or Gradle settings
 boundary. The nearest build file takes precedence; Gradle plugin defaults can come
 from root build/settings files. Maven supports local parents at `../pom.xml`.
+A root containing only `plugins { base }` can use the declarations of one literal
+`include("module")` (or Groovy `include 'module'`) from its settings file. Colon-separated
+nested paths are supported. Multiple/dynamic modules, project directory/build-file
+remapping, and child paths outside the root remain unresolved; no directory tree is scanned.
 Remote parents, active-profile evaluation, arbitrary Gradle expressions, convention
 plugins, and task-specific compiler overrides are not evaluated. Conflicting or
 unsupported version declarations are omitted rather than guessed.
