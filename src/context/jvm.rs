@@ -197,8 +197,15 @@ fn property(value: &str, properties: &BTreeMap<String, String>) -> Option<String
     None
 }
 
-// Tokens preserve strings and statement boundaries. Comments cannot masquerade as declarations.
-fn tokens(input: &str) -> Option<Vec<String>> {
+#[derive(Clone, Copy)]
+enum BlockComments {
+    KotlinNested,
+    StaticRoot,
+}
+
+// Module parsing retains Kotlin's nesting rules. Root aggregation uses only
+// comments that are unambiguous across Groovy and Kotlin.
+fn tokens(input: &str, comments: BlockComments) -> Option<Vec<String>> {
     let bytes = input.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -215,6 +222,9 @@ fn tokens(input: &str) -> Option<Vec<String>> {
                 let mut depth = 1;
                 while i + 1 < bytes.len() && depth > 0 {
                     if &bytes[i..i + 2] == b"/*" {
+                        if matches!(comments, BlockComments::StaticRoot) {
+                            return None;
+                        }
                         depth += 1;
                         i += 2;
                     } else if &bytes[i..i + 2] == b"*/" {
@@ -226,6 +236,11 @@ fn tokens(input: &str) -> Option<Vec<String>> {
                 }
                 if depth != 0 {
                     return None;
+                }
+                if matches!(comments, BlockComments::StaticRoot) {
+                    // Groovy block comments are newline tokens. Keeping that
+                    // separator avoids joining a method name with a later argument.
+                    out.push(";".into());
                 }
             }
             b'\'' | b'"' => {
@@ -320,7 +335,7 @@ fn gradle_declarations(
     properties: &BTreeMap<String, String>,
     catalog: Option<&toml::Table>,
 ) -> Option<GradleDeclarations> {
-    let tokens = tokens(input)?;
+    let tokens = tokens(input, BlockComments::KotlinNested)?;
     let mut out = GradleDeclarations::default();
     let mut scopes = Vec::new();
     let mut statement = Vec::new();
@@ -442,7 +457,7 @@ fn is_base_aggregator(build: &str) -> bool {
     if build.contains('\\') {
         return false;
     }
-    tokens(build).is_some_and(|tokens| {
+    tokens(build, BlockComments::StaticRoot).is_some_and(|tokens| {
         tokens
             .into_iter()
             .filter(|token| token != ";")
@@ -566,7 +581,7 @@ fn single_gradle_module(settings: &str) -> Option<PathBuf> {
     if settings.contains('\\') {
         return None;
     }
-    let tokens = tokens(settings)?;
+    let tokens = tokens(settings, BlockComments::StaticRoot)?;
     let mut nesting = [0_usize; 3];
     let mut statement = Vec::new();
     let mut module = None;
@@ -667,6 +682,8 @@ fn gradle_sole_module(root: &Path, inputs: &mut Inputs) -> Option<Versions> {
         (Some(build), None) | (None, Some(build)) => build,
         _ => return None,
     };
+    // The selected module must use the same unambiguous comment subset.
+    tokens(&build, BlockComments::StaticRoot)?;
     // This is a single bounded hop; gradle sees a module below its root and cannot
     // re-enter root aggregation. Input bytes and elapsed budget remain shared.
     gradle(&build, &directories, inputs)
@@ -1192,6 +1209,96 @@ include 'backend'"#,
             root.close()?;
             outside.close()?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_aggregation_rejects_nested_comment_openers() -> io::Result<()> {
+        for (settings, build) in [
+            (
+                "/* /* */ include 'other' // */\ninclude 'backend'",
+                "plugins { base }",
+            ),
+            (
+                "include 'backend'",
+                "/* /* */ plugins { java } // */\nplugins { base }",
+            ),
+            (
+                "/* outer /* inner */ outer */\ninclude 'backend'",
+                "plugins { base }",
+            ),
+            ("include /* separator */ 'backend'", "plugins { base }"),
+        ] {
+            let versions = fixture(
+                &[
+                    ("settings.gradle", settings),
+                    ("build.gradle", build),
+                    (
+                        "backend/build.gradle.kts",
+                        "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                    ),
+                ],
+                "",
+            )?;
+            assert!(versions.kotlin.is_none(), "{settings} / {build}");
+            assert!(versions.java.is_none(), "{settings} / {build}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_aggregation_rejects_nested_openers_in_the_selected_module() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                ("settings.gradle", "include 'backend'"),
+                ("build.gradle", "plugins { base }"),
+                (
+                    "backend/build.gradle",
+                    "plugins { id 'org.jetbrains.kotlin.jvm' version '2.4.0' }\nkotlin { jvmToolchain(25) }\n/* /* */ kotlin { jvmToolchain(21) } // */",
+                ),
+            ],
+            "",
+        )?;
+        assert!(versions.kotlin.is_none());
+        assert!(versions.java.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_aggregation_accepts_ordinary_block_comments() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                (
+                    "settings.gradle",
+                    "/* a single module */\ninclude 'backend'",
+                ),
+                ("build.gradle", "/* aggregator */\nplugins { base }"),
+                (
+                    "backend/build.gradle.kts",
+                    "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                ),
+            ],
+            "",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.4.0"));
+        assert_eq!(versions.java.as_deref(), Some("25"));
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_kotlin_modules_keep_nested_block_comment_support() -> io::Result<()> {
+        let versions = fixture(
+            &[
+                ("settings.gradle.kts", ""),
+                (
+                    "build.gradle.kts",
+                    "/* outer /* inner */ outer */\nplugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                ),
+            ],
+            "",
+        )?;
+        assert_eq!(versions.kotlin.as_deref(), Some("2.4.0"));
+        assert_eq!(versions.java.as_deref(), Some("25"));
         Ok(())
     }
 

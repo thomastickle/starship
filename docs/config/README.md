@@ -2594,7 +2594,7 @@ A root containing only `plugins { base }` can use the declarations of one litera
 `include("module")` (or Groovy `include 'module'`) from its settings file. Colon-separated
 nested paths are supported. Settings must contain only that standalone include, a literal
 root name, and a small static subset of plugin/repository-management blocks. Interpolated
-or escaped strings, arbitrary calls, conditional/qualified includes,
+or escaped strings, nested block-comment openers, arbitrary calls, conditional/qualified includes,
 module-directory aliases, descriptor remapping, and declaration files outside the root or
 across nested build/repository boundaries remain unresolved; no directory tree is scanned.
 Remote parents, active-profile evaluation, arbitrary Gradle expressions, convention
@@ -3020,7 +3020,7 @@ A root containing only `plugins { base }` can use the declarations of one litera
 `include("module")` (or Groovy `include 'module'`) from its settings file. Colon-separated
 nested paths are supported. Settings must contain only that standalone include, a literal
 root name, and a small static subset of plugin/repository-management blocks. Interpolated
-or escaped strings, arbitrary calls, conditional/qualified includes,
+or escaped strings, nested block-comment openers, arbitrary calls, conditional/qualified includes,
 module-directory aliases, descriptor remapping, and declaration files outside the root or
 across nested build/repository boundaries remain unresolved; no directory tree is scanned.
 Remote parents, active-profile evaluation, arbitrary Gradle expressions, convention
