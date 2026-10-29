@@ -206,7 +206,7 @@ fn tokens(input: &str) -> Option<Vec<String>> {
         let start = i;
         match bytes[i] {
             b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
+                while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
                     i += 1;
                 }
             }
@@ -243,7 +243,7 @@ fn tokens(input: &str) -> Option<Vec<String>> {
                 i += 1;
                 out.push(input[start..i].to_owned());
             }
-            b'\n' | b';' => {
+            b'\n' | b'\r' | b';' => {
                 out.push(";".into());
                 i += 1;
             }
@@ -439,6 +439,9 @@ fn gradle_statement(
 /// Only a base-only root can borrow its sole module's declarations. Compiling or
 /// dynamically configured roots may select their own compiler independently.
 fn is_base_aggregator(build: &str) -> bool {
+    if build.contains('\\') {
+        return false;
+    }
     tokens(build).is_some_and(|tokens| {
         tokens
             .into_iter()
@@ -468,6 +471,71 @@ fn included_module_path(name: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+fn static_settings_string(word: &str) -> bool {
+    unquote(word).is_some_and(|value| !value.contains(['$', '\\']))
+}
+
+fn static_settings_block(body: &[&str]) -> bool {
+    // These settings APIs configure repositories or default plugin coordinates.
+    // Arbitrary calls, reflection, dynamic method names, and expressions are not
+    // part of the static subset and could change the included project set.
+    let mut depth = 1_usize;
+    for (index, &word) in body.iter().enumerate() {
+        if unquote(word).is_some() {
+            if !static_settings_string(word)
+                || body.get(index + 1) == Some(&"(")
+                || index > 0 && (unquote(body[index - 1]).is_some() || body[index - 1] == ")")
+            {
+                return false;
+            }
+        } else if !matches!(
+            word,
+            "{" | "}"
+                | "("
+                | ")"
+                | "="
+                | ","
+                | "repositories"
+                | "gradlePluginPortal"
+                | "mavenCentral"
+                | "mavenLocal"
+                | "google"
+                | "maven"
+                | "url"
+                | "url.set"
+                | "uri"
+                | "credentials"
+                | "username"
+                | "password"
+                | "repositoriesMode.set"
+                | "RepositoriesMode.FAIL_ON_PROJECT_REPOS"
+                | "RepositoriesMode.PREFER_SETTINGS"
+                | "RepositoriesMode.PREFER_PROJECT"
+                | "plugins"
+                | "id"
+                | "kotlin"
+                | "version"
+        ) {
+            return false;
+        }
+        match word {
+            "{" => depth += 1,
+            "}" => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+            }
+            ")" if body.get(index + 1) == Some(&"(") => return false,
+            _ => (),
+        }
+        if depth == 0 && index + 1 != body.len() {
+            return false;
+        }
+    }
+    depth == 0
+}
+
 fn settings_statement(statement: &[&str], module: &mut Option<PathBuf>) -> Option<()> {
     match statement {
         [] => (),
@@ -483,18 +551,7 @@ fn settings_statement(statement: &[&str], module: &mut Option<PathBuf>) -> Optio
             "{",
             rest @ ..,
         ] if rest.last() == Some(&"}") => {
-            let mut depth = 1_usize;
-            for (index, token) in rest.iter().enumerate() {
-                match *token {
-                    "{" => depth += 1,
-                    "}" => depth = depth.checked_sub(1)?,
-                    _ => (),
-                }
-                if depth == 0 && index + 1 != rest.len() {
-                    return None;
-                }
-            }
-            if depth != 0 {
+            if !static_settings_block(rest) {
                 return None;
             }
         }
@@ -504,12 +561,20 @@ fn settings_statement(statement: &[&str], module: &mut Option<PathBuf>) -> Optio
 }
 
 fn single_gradle_module(settings: &str) -> Option<PathBuf> {
+    // Escape preprocessing differs between Groovy and Kotlin, including comments.
+    // Escaped source is outside this deliberately static settings subset.
+    if settings.contains('\\') {
+        return None;
+    }
     let tokens = tokens(settings)?;
     let mut nesting = [0_usize; 3];
     let mut statement = Vec::new();
     let mut module = None;
     for token in &tokens {
         let word = token.as_str();
+        if unquote(word).is_some() && !static_settings_string(word) {
+            return None;
+        }
         let method = word.rsplit('.').next()?;
         // No conditional/qualified calls, composite builds, descriptor changes,
         // or externally applied settings scripts can silently add/remap modules.
@@ -946,6 +1011,63 @@ mod tests {
             let versions = fixture(
                 &[
                     ("settings.gradle.kts", settings),
+                    ("build.gradle.kts", "plugins { base }"),
+                    (
+                        "backend/build.gradle.kts",
+                        "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                    ),
+                ],
+                "",
+            )?;
+            assert!(versions.kotlin.is_none(), "{settings}");
+            assert!(versions.java.is_none(), "{settings}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_root_rejects_interpolated_or_escaped_root_names() -> io::Result<()> {
+        for settings in [
+            r#"rootProject.name = "${include('other')}"
+include 'backend'"#,
+            r#"rootProject.name = "\u0024{include('other')}"
+include 'backend'"#,
+            r#"// \u000a include 'other'
+include 'backend'"#,
+        ] {
+            let versions = fixture(
+                &[
+                    ("settings.gradle", settings),
+                    ("build.gradle.kts", "plugins { base }"),
+                    (
+                        "backend/build.gradle.kts",
+                        "plugins { kotlin(\"jvm\") version \"2.4.0\" }\nkotlin { jvmToolchain(25) }",
+                    ),
+                ],
+                "",
+            )?;
+            assert!(versions.kotlin.is_none(), "{settings}");
+            assert!(versions.java.is_none(), "{settings}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gradle_root_rejects_executable_repository_settings() -> io::Result<()> {
+        for settings in [
+            r#"pluginManagement { repositories { maven { url = "${include('other')}" } } }
+include 'backend'"#,
+            r#"dependencyResolutionManagement { repositories { maven { url = "${include('other')}" } } }
+include 'backend'"#,
+            r#"pluginManagement { settings.invokeMethod('include', ['other']) }
+include 'backend'"#,
+            r#"pluginManagement { settings.'include'('other') }
+include 'backend'"#,
+            "include 'backend'\r// comment\rsettings.include 'other'",
+        ] {
+            let versions = fixture(
+                &[
+                    ("settings.gradle", settings),
                     ("build.gradle.kts", "plugins { base }"),
                     (
                         "backend/build.gradle.kts",
